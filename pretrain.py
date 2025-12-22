@@ -191,45 +191,49 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 for param in list(model.parameters()) + list(model.buffers()):
                     dist.broadcast(param, src=0)
 
-    adam_params = [p for p in model.parameters() if p.ndim != 2]
-    muon_params = [p for p in model.parameters() if p.ndim == 2]
+    if config.use_muon:
+        adam_params = [p for p in model.parameters() if p.ndim != 2]
+        muon_params = [p for p in model.parameters() if p.ndim == 2]
 
-    optimizers = [
-        CastedSparseEmbeddingSignSGD_Distributed(
-            model.model.puzzle_emb.buffers(),  # type: ignore
-            lr=0,  # Needs to be set by scheduler
-            weight_decay=config.puzzle_emb_weight_decay,
-            world_size=world_size,
-        ),
-        # Muon([
-        #     {
-        #         "params": muon_params,
-        #         "use_muon": True,
-        #         "lr": 1e-4,
-        #     },
-        #     {
-        #         "params": adam_params,
-        #         "use_muon": False,
-        #         "lr": 1e-4,
-        #         "weight_decay": 0.1,
-        #         "adamw_betas": (0.9, 0.95),
-        #         "adamw_eps": 1e-8,
-        #     },
-        # ]),
-        # MuonAdamAtan2(
-        #     muon_params=muon_params,
-        #     params=adam_params,
-        #     lr=0.0001,
-        #     weight_decay=0.1,
-        #     betas=(0.9, 0.95),
-        # ),
-        AdamATan2(
-            model.parameters(),
-            lr=0,  # Needs to be set by scheduler
-            weight_decay=config.weight_decay,
-            betas=(config.beta1, config.beta2),
-        ),
-    ]
+        optimizers = [
+            CastedSparseEmbeddingSignSGD_Distributed(
+                model.model.puzzle_emb.buffers(),  # type: ignore
+                lr=0,  # Needs to be set by scheduler
+                weight_decay=config.puzzle_emb_weight_decay,
+                world_size=world_size,
+            ),
+            Muon([
+                {
+                    "params": muon_params,
+                    "use_muon": True,
+                    "lr": 1e-4,
+                },
+                {
+                    "params": adam_params,
+                    "use_muon": False,
+                    "lr": 1e-4,
+                    "weight_decay": 0.1,
+                    "adamw_betas": (0.9, 0.95),
+                    "adamw_eps": 1e-8,
+                },
+            ]),
+        ]
+    else:
+        optimizers = [
+            CastedSparseEmbeddingSignSGD_Distributed(
+                model.model.puzzle_emb.buffers(),  # type: ignore
+                lr=0,  # Needs to be set by scheduler
+                weight_decay=config.puzzle_emb_weight_decay,
+                world_size=world_size,
+            ),
+            AdamATan2(
+                model.parameters(),
+                lr=0,  # Needs to be set by scheduler
+                weight_decay=config.weight_decay,
+                betas=(config.beta1, config.beta2),
+            ),
+        ]
+
     optimizer_lrs = [config.puzzle_emb_lr, config.lr]
 
     return model, optimizers, optimizer_lrs
