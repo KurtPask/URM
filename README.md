@@ -25,6 +25,10 @@ arch.H_cycles=3 arch.L_cycles=6 \
 +run_name=${run_name} ema=True
 ```
 
+Results:
+<img width="1046" height="642" alt="image" src="https://github.com/user-attachments/assets/c0699d98-64d1-4f41-9c8f-818f924ad77b" />
+
+
 ## Installation
 ```bash
 pip install -r requirements.txt
