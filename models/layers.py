@@ -136,6 +136,124 @@ class Attention(nn.Module):
         return self.o_proj(attn_output)
 
 
+class TropicalLinear(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.W = nn.Parameter(torch.randn(output_dim, input_dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_expanded = x.unsqueeze(-2)
+        W_expanded = self.W.unsqueeze(0)
+        Wx = x_expanded + W_expanded
+        y, _ = torch.max(Wx, dim=-1)
+        return y
+
+
+class TropicalAttention(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        head_dim: int,
+        num_heads: int,
+        num_key_value_heads: int,
+        causal: bool = False,
+        attn_dropout: float = 0.0,
+        tropical_proj: bool = True,
+        tropical_norm: bool = False,
+        symmetric: bool = True,
+        device: Optional[torch.device] = None,
+    ):
+        super().__init__()
+        if hidden_size % num_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_heads.")
+        if head_dim != hidden_size // num_heads:
+            raise ValueError("head_dim must match hidden_size // num_heads.")
+
+        self.d_k = hidden_size // num_heads
+        self.n_heads = num_heads
+        self.tropical_proj = tropical_proj
+        self.tropical_norm = tropical_norm
+        self.symmetric = symmetric
+        self.num_key_value_heads = num_key_value_heads
+        self.causal = causal
+        self.attn_dropout = attn_dropout
+
+        self.out = nn.Linear(hidden_size, hidden_size, bias=False)
+
+        if self.tropical_proj:
+            self.query_trop = TropicalLinear(self.d_k, self.d_k)
+            self.key_trop = TropicalLinear(self.d_k, self.d_k)
+            self.value_trop = TropicalLinear(self.d_k, self.d_k)
+
+        if self.tropical_norm:
+            if device is None:
+                self.lambda_param = nn.Parameter(torch.ones(1, 1, hidden_size))
+            else:
+                self.lambda_param = nn.Parameter(torch.ones(1, 1, hidden_size, device=device))
+
+    def normalize_tropical(self, x: torch.Tensor) -> torch.Tensor:
+        return x - self.lambda_param
+
+    def forward_with_scores(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, _ = x.size()
+
+        if self.tropical_norm:
+            q = self.normalize_tropical(torch.log1p(F.relu(x)))
+            k = self.normalize_tropical(torch.log1p(F.relu(x)))
+            v = self.normalize_tropical(torch.log1p(F.relu(x)))
+        else:
+            q = torch.log1p(F.relu(x))
+            k = torch.log1p(F.relu(x))
+            v = torch.log1p(F.relu(x))
+
+        q = q.reshape(batch_size, seq_len, self.n_heads, self.d_k).permute(0, 2, 1, 3)
+        k = k.reshape(batch_size, seq_len, self.n_heads, self.d_k).permute(0, 2, 1, 3)
+        v = v.reshape(batch_size, seq_len, self.n_heads, self.d_k).permute(0, 2, 1, 3)
+
+        B = batch_size * self.n_heads
+        q = q.reshape(B, seq_len, self.d_k)
+        k = k.reshape(B, seq_len, self.d_k)
+        v = v.reshape(B, seq_len, self.d_k)
+
+        if self.tropical_proj:
+            q = self.query_trop(q)
+            k = self.key_trop(k)
+            v = self.value_trop(v)
+
+        if self.symmetric:
+            diff = q.unsqueeze(2) - k.unsqueeze(1)
+            max_diff, _ = diff.max(dim=-1)
+            min_diff, _ = diff.min(dim=-1)
+            d_trop = max_diff - min_diff
+            attn_scores = -d_trop
+        else:
+            diff = q.unsqueeze(2) - k.unsqueeze(3)
+            sum_diff = diff.sum(dim=-1)
+            min_diff = diff.amin(dim=-1)
+            n = q.size(-1)
+            attn_scores = -(sum_diff - n * min_diff)
+
+        sum_sv = attn_scores.unsqueeze(-1) + v.unsqueeze(1)
+        context = sum_sv.max(dim=2).values
+
+        context = (
+            context.reshape(batch_size, self.n_heads, seq_len, self.d_k)
+            .permute(0, 2, 1, 3)
+            .reshape(batch_size, seq_len, -1)
+        )
+
+        context = torch.expm1(context)
+        output = self.out(context)
+
+        return output, attn_scores
+
+    def forward(self, cos_sin: Optional[CosSin], hidden_states: torch.Tensor) -> torch.Tensor:
+        output, _ = self.forward_with_scores(hidden_states)
+        return output
+
+
 class SwiGLU(nn.Module):
     def __init__(self, hidden_size: int, expansion: float, mlp_dropout: float = 0.0):
         super().__init__()
