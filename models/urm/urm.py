@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 from pydantic import BaseModel
 from models.common import trunc_normal_init_
-from models.layers import rms_norm, ConvSwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
+from models.layers import rms_norm, ConvSwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear, TropicalAttention
 from models.sparse_embedding import CastedSparseEmbedding
 
 
@@ -42,7 +42,7 @@ class URMConfig(BaseModel):
 class URMBlock(nn.Module):
     def __init__(self, config: URMConfig) -> None:
         super().__init__()
-        self.self_attn = Attention(
+        self.self_attn = TropicalAttention(  # Original: TropicalAttention(
             hidden_size=config.hidden_size,
             head_dim=config.hidden_size // config.num_heads,
             num_heads=config.num_heads,

@@ -19,12 +19,18 @@ import coolname
 import hydra
 import pydantic
 from omegaconf import DictConfig
-from adam_atan2 import AdamATan2
+#from adam_atan2 import AdamATan2
+from adam_atan2_pytorch import AdamAtan2
 # from adam_atan2_pytorch import MuonAdamAtan2
 from models.muon import Muon
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
+
+from torch.nn.parallel import DistributedDataParallel as DDP # added
+
+def unwrap(m: nn.Module) -> nn.Module:
+    return m.module if hasattr(m, "module") else m
 
 
 class EMAHelper(object):
@@ -157,7 +163,7 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
         split=split,
     )
     dataloader = DataLoader(
-        dataset, batch_size=None, num_workers=1, prefetch_factor=8, pin_memory=True, persistent_workers=True
+        dataset, batch_size=None, num_workers=1, prefetch_factor=8, pin_memory=True, persistent_workers=True #og 1
     )
     return dataloader, dataset.metadata
 
@@ -228,9 +234,9 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 weight_decay=config.puzzle_emb_weight_decay,
                 world_size=world_size,
             ),
-            AdamATan2(
+            AdamAtan2(
                 model.parameters(),
-                lr=0,  # Needs to be set by scheduler
+                lr=0.00001,  # Needs to be set by scheduler
                 weight_decay=config.weight_decay,
                 betas=(config.beta1, config.beta2),
             ),
@@ -261,7 +267,7 @@ def cosine_schedule_with_warmup_lr_lambda(
 
 
 def init_train_state(
-    config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int
+    config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int, local_rank: int
 ):
     # Estimated total training steps
     effective_gbs = config.global_batch_size * max(1, config.grad_accum_steps)
@@ -274,6 +280,11 @@ def init_train_state(
 
     # Model
     model, optimizers, optimizer_lrs = create_model(config, train_metadata, rank=rank, world_size=world_size)
+
+    if world_size > 1:
+        assert local_rank is not None
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
+
 
     train_state = TrainState(
         step=0,
@@ -537,7 +548,7 @@ def train_batch(
     # Init carry if it is None
     if train_state.carry is None:
         with torch.device("cuda"):
-            train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
+            train_state.carry = unwrap(train_state.model).initial_carry(batch)  # type: ignore #unwrap
 
     # Forward
     compute_target_q = train_state.step % config.target_q_update_every == 0
@@ -553,16 +564,17 @@ def train_batch(
     if not should_step:
         return
 
+    # \/ \/ \/ commenting out in attempt to speed up \/ \/ \/ 
     # Allreduce
-    if world_size > 1:
-        for param in train_state.model.parameters():
-            if not param.requires_grad:
-                continue
+    # if world_size > 1:
+    #     for param in train_state.model.parameters():
+    #         if not param.requires_grad:
+    #             continue
 
-            grad = param.grad
-            if grad is None:
-                grad = torch.zeros_like(param)
-            dist.all_reduce(grad)
+    #         grad = param.grad
+    #         if grad is None:
+    #             grad = torch.zeros_like(param)
+    #         dist.all_reduce(grad)
 
     # Apply optimizer
     lr_this_step = None
@@ -645,7 +657,7 @@ def evaluate(
             # To device
             batch = {k: v.cuda() for k, v in batch.items()}
             with torch.device("cuda"):
-                carry = train_state.model.initial_carry(batch)  # type: ignore
+                carry = unwrap(train_state.model).initial_carry(batch)  # type: ignore #unwrap
 
             # Forward
             inference_steps = 0
@@ -755,25 +767,29 @@ def evaluate(
 def save_code_and_config(config: PretrainConfig, save_dir: str):
     import os, json
     import yaml
+    from omegaconf import OmegaConf
+
+    os.makedirs(save_dir, exist_ok=True)
 
     cfg_path = os.path.join(save_dir, "config.yaml")
     json_path = os.path.join(save_dir, "config.json")
 
-    config_dict = json.loads(config.model_dump_json())
+    # Convert Pydantic -> python objects, then OmegaConf -> plain containers
+    config_py = config.model_dump(mode="python")
+    config_dict = OmegaConf.to_container(OmegaConf.create(config_py), resolve=True)
 
     try:
         with open(cfg_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(config_dict, f, sort_keys=False, allow_unicode=True)
-
     except Exception as e:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(config_dict, f, ensure_ascii=False, indent=2)
-
         with open(cfg_path, "w", encoding="utf-8") as f:
             f.write(
                 "# Failed to write config as YAML, wrote config.json instead.\n"
                 f"# Error: {type(e).__name__}: {e}\n"
             )
+
 
 
 def _get_loop_config(model: nn.Module):
@@ -828,7 +844,10 @@ def launch(hydra_config: DictConfig):
         RANK = dist.get_rank()
         WORLD_SIZE = dist.get_world_size()
 
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        LOCAL_RANK = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(LOCAL_RANK)
+        # model = model.to("cuda") # added
+        # model = DDP(model, device_ids=[os.environ["LOCAL_RANK"]], output_device=os.environ["LOCAL_RANK"], broadcast_buffers=False) # added
 
         # CPU GLOO process group
         CPU_PROCESS_GROUP = dist.new_group(backend="gloo")
@@ -840,7 +859,7 @@ def launch(hydra_config: DictConfig):
     config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
     # Seed RNGs to ensure consistency
     torch.random.manual_seed(config.seed + RANK)
-
+    print(config) #added
     # Dataset
     # Train loader
     train_epochs_per_iter = config.eval_interval
@@ -877,7 +896,7 @@ def launch(hydra_config: DictConfig):
         evaluators = []
 
     # Train state
-    train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
+    train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE, local_rank=LOCAL_RANK)
 
     ema_helper = None
     if config.ema:
@@ -885,7 +904,7 @@ def launch(hydra_config: DictConfig):
             print("Setup EMA")
         ema_helper = EMAHelper(mu=config.ema_rate)
         ema_helper.register(train_state.model)
-
+    print(config) #added
     # Progress bar and logger
     progress_bar = None
     if RANK == 0:
@@ -900,19 +919,20 @@ def launch(hydra_config: DictConfig):
             settings=wandb.Settings(_disable_stats=True),
         )
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
-        save_code_and_config(config)
+        save_code_and_config(config, config.checkpoint_path)
 
     # Training Loop
     for _iter_id in range(total_iters):
-        if RANK == 0:
-            count = 0
-            for set_name, batch, global_batch_size in train_loader:
-                count += 1
-            print(f"_iter_id: {_iter_id}")
-            print(f"train_epochs_per_iter: {train_epochs_per_iter}")
-            print(f"total_iters: {total_iters}")
-            print(f"train_loader len: {count}")
-            print(f"Epoch {_iter_id * train_epochs_per_iter}")
+        # \/ \/ \/ Seemed unneeded so I commented it out \/ \/ \/
+        # if RANK == 0:
+        #     count = 0
+        #     for set_name, batch, global_batch_size in train_loader:
+        #         count += 1
+        #     print(f"_iter_id: {_iter_id}")
+        #     print(f"train_epochs_per_iter: {train_epochs_per_iter}")
+        #     print(f"total_iters: {total_iters}")
+        #     print(f"train_loader len: {count}")
+        #     print(f"Epoch {_iter_id * train_epochs_per_iter}")
 
         ############ Train Iter
         train_state.model.train()

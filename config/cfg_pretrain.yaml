@@ -14,7 +14,9 @@ evaluators:
   - name: arc@ARC
 
 # Hyperparams - Training
-global_batch_size: 768
+## originally 768
+global_batch_size: 12
+# orginally 1
 grad_accum_steps: 1
 
 epochs: 200000
