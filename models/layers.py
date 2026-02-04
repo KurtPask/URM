@@ -151,6 +151,29 @@ class TropicalLinear(nn.Module):
         return y
 
 
+class DeepSet(nn.Module):
+    def __init__(self, dim: int, hidden_dim: Optional[int] = None):
+        super().__init__()
+        hidden = dim if hidden_dim is None else hidden_dim
+        self.phi = nn.Sequential(
+            nn.Linear(dim, hidden, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden, dim, bias=True),
+        )
+        self.rho = nn.Sequential(
+            nn.Linear(dim, hidden, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden, dim, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, seq_len, dim] -> [batch, 1, dim]
+        phi_x = self.phi(x)
+        pooled = phi_x.mean(dim=1)
+        out = self.rho(pooled)
+        return out.unsqueeze(1)
+
+
 class TropicalAttention(nn.Module):
     def __init__(
         self,
@@ -161,7 +184,8 @@ class TropicalAttention(nn.Module):
         causal: bool = False,
         attn_dropout: float = 0.0,
         tropical_proj: bool = True,
-        tropical_norm: bool = False,
+        tropical_qkv_proj: bool = False,
+        tropical_norm: str = "none",
         symmetric: bool = True,
         device: Optional[torch.device] = None,
     ):
@@ -174,6 +198,11 @@ class TropicalAttention(nn.Module):
         self.d_k = hidden_size // num_heads
         self.n_heads = num_heads
         self.tropical_proj = tropical_proj
+        self.tropical_qkv_proj = tropical_qkv_proj
+        if isinstance(tropical_norm, bool):
+            tropical_norm = "learnable" if tropical_norm else "none"
+        if tropical_norm not in ("none", "max", "learnable"):
+            raise ValueError("tropical_norm must be one of: 'none', 'max', 'learnable'.")
         self.tropical_norm = tropical_norm
         self.symmetric = symmetric
         self.num_key_value_heads = num_key_value_heads
@@ -182,31 +211,42 @@ class TropicalAttention(nn.Module):
 
         self.out = nn.Linear(hidden_size, hidden_size, bias=False)
 
+        if self.tropical_qkv_proj:
+            self.query_proj = TropicalLinear(hidden_size, hidden_size)
+            self.key_proj = TropicalLinear(hidden_size, hidden_size)
+            self.value_proj = TropicalLinear(hidden_size, hidden_size)
+
         if self.tropical_proj:
             self.query_trop = TropicalLinear(self.d_k, self.d_k)
             self.key_trop = TropicalLinear(self.d_k, self.d_k)
             self.value_trop = TropicalLinear(self.d_k, self.d_k)
 
-        if self.tropical_norm:
-            if device is None:
-                self.lambda_param = nn.Parameter(torch.ones(1, 1, hidden_size))
-            else:
-                self.lambda_param = nn.Parameter(torch.ones(1, 1, hidden_size, device=device))
+        if self.tropical_norm == "learnable":
+            self.deepset = DeepSet(hidden_size)
 
     def normalize_tropical(self, x: torch.Tensor) -> torch.Tensor:
-        return x - self.lambda_param
+        if self.tropical_norm == "none":
+            return x
+        if self.tropical_norm == "max":
+            return x - x.max(dim=-1, keepdim=True).values
+        if self.tropical_norm == "learnable":
+            return x - self.deepset(x)
+        raise ValueError("Invalid tropical_norm.")
 
     def forward_with_scores(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.size()
 
-        if self.tropical_norm:
-            q = self.normalize_tropical(torch.log1p(F.relu(x)))
-            k = self.normalize_tropical(torch.log1p(F.relu(x)))
-            v = self.normalize_tropical(torch.log1p(F.relu(x)))
+        x_pos = torch.log1p(F.relu(x))
+        if self.tropical_norm != "none":
+            x_pos = self.normalize_tropical(x_pos)
+        if self.tropical_qkv_proj:
+            q = self.query_proj(x_pos)
+            k = self.key_proj(x_pos)
+            v = self.value_proj(x_pos)
         else:
-            q = torch.log1p(F.relu(x))
-            k = torch.log1p(F.relu(x))
-            v = torch.log1p(F.relu(x))
+            q = x_pos
+            k = x_pos
+            v = x_pos
 
         q = q.reshape(batch_size, seq_len, self.n_heads, self.d_k).permute(0, 2, 1, 3)
         k = k.reshape(batch_size, seq_len, self.n_heads, self.d_k).permute(0, 2, 1, 3)

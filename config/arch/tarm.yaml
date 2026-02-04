@@ -1,0 +1,24 @@
+name: tarm.tarm@TARM
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+
+# Default: non-recursive TARM
+loops: 1
+H_cycles: 1
+L_cycles: 1
+
+num_layers: 8
+hidden_size: 512
+num_heads: 8
+expansion: 4
+
+puzzle_emb_ndim: ${.hidden_size}
+pos_encodings: learned
+
+# Tropical attention options
+tropical_proj: true
+tropical_qkv_proj: true
+tropical_norm: none
+
+forward_dtype: bfloat16
