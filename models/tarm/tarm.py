@@ -30,7 +30,7 @@ class TARMConfig(BaseModel):
     num_heads: int
     pos_encodings: str
     tropical_proj: bool = True
-    tropical_qkv_proj: bool = True
+    tropical_qkv_proj: bool = False
     tropical_norm: str = "none"
     attn_dropout: float = 0.0
     mlp_dropout: float = 0.0

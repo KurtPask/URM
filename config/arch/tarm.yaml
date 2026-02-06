@@ -18,7 +18,7 @@ pos_encodings: learned
 
 # Tropical attention options
 tropical_proj: true
-tropical_qkv_proj: true
+tropical_qkv_proj: false
 tropical_norm: none
 
 forward_dtype: bfloat16

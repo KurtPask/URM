@@ -137,11 +137,27 @@ class Attention(nn.Module):
 
 
 class TropicalLinear(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        diag_init: float = 0.0,
+        offdiag_init: float = -9.0,
+        init_jitter_std: float = 1e-3,
+    ):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
-        self.W = nn.Parameter(torch.randn(output_dim, input_dim))
+
+        # Initialize near tropical identity: diagonal ~ 0, off-diagonal very negative.
+        weight = torch.full((output_dim, input_dim), offdiag_init, dtype=torch.float32)
+        diag_size = min(input_dim, output_dim)
+        diag_idx = torch.arange(diag_size)
+        weight[diag_idx, diag_idx] = diag_init
+        if init_jitter_std > 0:
+            weight = weight + init_jitter_std * torch.randn_like(weight)
+
+        self.W = nn.Parameter(weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_expanded = x.unsqueeze(-2)
@@ -269,7 +285,7 @@ class TropicalAttention(nn.Module):
             d_trop = max_diff - min_diff
             attn_scores = -d_trop
         else:
-            diff = q.unsqueeze(2) - k.unsqueeze(3)
+            diff = q.unsqueeze(2) - k.unsqueeze(1)
             sum_diff = diff.sum(dim=-1)
             min_diff = diff.amin(dim=-1)
             n = q.size(-1)
