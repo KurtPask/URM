@@ -42,7 +42,7 @@ class URMConfig(BaseModel):
 class URMBlock(nn.Module):
     def __init__(self, config: URMConfig) -> None:
         super().__init__()
-        self.self_attn = TropicalAttention(  # Original: TropicalAttention(
+        self.self_attn = Attention(  # Original: TropicalAttention(
             hidden_size=config.hidden_size,
             head_dim=config.hidden_size // config.num_heads,
             num_heads=config.num_heads,
