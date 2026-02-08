@@ -199,6 +199,9 @@ class TropicalAttention(nn.Module):
         num_key_value_heads: int,
         causal: bool = False,
         attn_dropout: float = 0.0,
+        q_dropout: float = 0.0,
+        k_dropout: float = 0.0,
+        v_dropout: float = 0.0,
         tropical_proj: bool = True,
         tropical_qkv_proj: bool = False,
         tropical_norm: str = "none",
@@ -226,6 +229,9 @@ class TropicalAttention(nn.Module):
         self.attn_dropout = attn_dropout
 
         self.out = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.q_dropout = nn.Dropout(q_dropout)
+        self.k_dropout = nn.Dropout(k_dropout)
+        self.v_dropout = nn.Dropout(v_dropout)
 
         if self.tropical_qkv_proj:
             self.query_proj = TropicalLinear(hidden_size, hidden_size)
@@ -277,6 +283,10 @@ class TropicalAttention(nn.Module):
             q = self.query_trop(q)
             k = self.key_trop(k)
             v = self.value_trop(v)
+
+        q = self.q_dropout(q)
+        k = self.k_dropout(k)
+        v = self.v_dropout(v)
 
         if self.symmetric:
             diff = q.unsqueeze(2) - k.unsqueeze(1)
