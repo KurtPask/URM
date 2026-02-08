@@ -33,6 +33,9 @@ class TARMConfig(BaseModel):
     tropical_qkv_proj: bool = False
     tropical_norm: str = "none"
     attn_dropout: float = 0.0
+    q_dropout: float = 0.0
+    k_dropout: float = 0.0
+    v_dropout: float = 0.0
     mlp_dropout: float = 0.0
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
@@ -54,6 +57,9 @@ class TARMBlock(nn.Module):
             tropical_proj=config.tropical_proj,
             tropical_qkv_proj=config.tropical_qkv_proj,
             tropical_norm=config.tropical_norm,
+            q_dropout=config.q_dropout,
+            k_dropout=config.k_dropout,
+            v_dropout=config.v_dropout,
         )
         self.mlp = ConvSwiGLU(
             hidden_size=config.hidden_size,

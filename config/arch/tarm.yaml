@@ -20,5 +20,8 @@ pos_encodings: learned
 tropical_proj: true
 tropical_qkv_proj: false
 tropical_norm: none
+q_dropout: 0.0
+k_dropout: 0.0
+v_dropout: 0.0
 
 forward_dtype: bfloat16
