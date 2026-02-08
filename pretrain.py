@@ -128,6 +128,10 @@ class PretrainConfig(pydantic.BaseModel):
     load_checkpoint: Optional[str] = None
     load_strict: bool = True
     load_optimizer_state: bool = True
+    load_filter_mismatched_shapes: bool = False
+    init_checkpoint: Optional[str] = None
+    init_strict: bool = False
+    init_filter_mismatched_shapes: bool = True
 
     seed: int = 0
     checkpoint_every_eval: bool = False
@@ -198,6 +202,15 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             with torch.no_grad():
                 for param in list(model.parameters()) + list(model.buffers()):
                     dist.broadcast(param, src=0)
+
+    if config.init_checkpoint is not None:
+        _load_checkpoint_weights(
+            model,
+            config.init_checkpoint,
+            strict=config.init_strict,
+            filter_mismatched_shapes=config.init_filter_mismatched_shapes,
+            rank=rank,
+        )
 
     if config.use_muon:
         adam_params = [p for p in model.parameters() if p.ndim != 2]
@@ -397,6 +410,63 @@ def _resize_puzzle_embedding_if_needed(model: nn.Module, state_dict: dict):
             )
 
 
+def _filter_state_dict_for_model(model: nn.Module, state_dict: dict, rank: int) -> dict:
+    model_state = model.state_dict()
+    filtered = {}
+    missing = []
+    mismatched = []
+    for key, value in state_dict.items():
+        if key not in model_state:
+            missing.append(key)
+            continue
+        if value.shape != model_state[key].shape:
+            mismatched.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+            continue
+        filtered[key] = value
+
+    if rank == 0:
+        if missing:
+            print(f"Filtered {len(missing)} keys not present in model state_dict.")
+        if mismatched:
+            print(f"Filtered {len(mismatched)} keys with mismatched shapes.")
+
+    return filtered
+
+
+def _extract_state_dict(checkpoint: Any) -> tuple[dict, dict]:
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        return checkpoint["model_state_dict"], checkpoint
+    return checkpoint, {}
+
+
+def _load_checkpoint_weights(
+    model: nn.Module,
+    checkpoint_path: str,
+    *,
+    strict: bool,
+    filter_mismatched_shapes: bool,
+    rank: int,
+) -> None:
+    resolved_path = _resolve_checkpoint_path(checkpoint_path)
+    if resolved_path is None:
+        raise FileNotFoundError(f"Could not resolve checkpoint path from '{checkpoint_path}'")
+
+    if rank == 0:
+        print(f"Loading checkpoint weights from {resolved_path}")
+
+    checkpoint = torch.load(resolved_path, map_location="cpu")
+    state_dict, _ = _extract_state_dict(checkpoint)
+    _resize_puzzle_embedding_if_needed(model, state_dict)
+
+    if filter_mismatched_shapes:
+        state_dict = _filter_state_dict_for_model(model, state_dict, rank)
+        if strict and rank == 0:
+            print("Warning: init_filter_mismatched_shapes=True requires init_strict=False. Overriding to False.")
+        strict = False
+
+    model.load_state_dict(state_dict, strict=strict, assign=True)
+
+
 def load_checkpoint(train_state: TrainState, config: PretrainConfig, rank: int):
     load_path = config.load_checkpoint
     if load_path is None:
@@ -431,21 +501,19 @@ def load_checkpoint(train_state: TrainState, config: PretrainConfig, rank: int):
 
         return tensor_state
 
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        state_dict = checkpoint["model_state_dict"]
-        optimizer_states = checkpoint.get("optimizer_states")
-        step = checkpoint.get("step")
-        rng_state = checkpoint.get("rng_state")
-        cuda_rng_state = checkpoint.get("cuda_rng_state")
-    else:
-        # Backwards compatibility with checkpoints that only contain model weights
-        state_dict = checkpoint
-        optimizer_states = None
-        step = None
-        rng_state = None
-        cuda_rng_state = None
+    state_dict, checkpoint_meta = _extract_state_dict(checkpoint)
+    optimizer_states = checkpoint_meta.get("optimizer_states")
+    step = checkpoint_meta.get("step")
+    rng_state = checkpoint_meta.get("rng_state")
+    cuda_rng_state = checkpoint_meta.get("cuda_rng_state")
 
     _resize_puzzle_embedding_if_needed(train_state.model, state_dict)
+    if config.load_filter_mismatched_shapes:
+        state_dict = _filter_state_dict_for_model(train_state.model, state_dict, rank)
+        if config.load_strict and rank == 0:
+            print("Warning: load_filter_mismatched_shapes=True requires load_strict=False. Overriding to False.")
+        if config.load_strict:
+            config.load_strict = False
     try:
         load_result = train_state.model.load_state_dict(
             state_dict, strict=config.load_strict, assign=True
