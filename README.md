@@ -75,6 +75,23 @@ bash scripts/URM_arcagi2.sh
 bash scripts/URM_sudoku.sh
 ```
 
+
+## Evaluating a Pretrained Sudoku Checkpoint
+```bash
+# Direct Python entrypoint
+python evaluate_pretrained_sudoku.py \
+  --checkpoint-path checkpoints/URM-sudoku/step_83325.pt \
+  --data-path data/sudoku-extreme-1k-aug-1000 \
+  --output-dir eval_results/sudoku
+
+# Or helper shell wrapper
+bash scripts/evaluate_sudoku_pretrained.sh checkpoints/URM-sudoku/step_83325.pt
+```
+
+Notes:
+- The Sudoku evaluator expects the dataset layout produced by `data/build_sudoku_dataset.py` (`train/`, `test/`, and `identifiers.json`).
+- Evaluation always calls `model.eval()`, so dropout is disabled automatically during inference.
+
 ### Citation
 ```
 @misc{gao2025universalreasoningmodel,
