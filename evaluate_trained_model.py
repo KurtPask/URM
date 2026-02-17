@@ -44,6 +44,17 @@ from pretrain import (
 from utils import load_model_class
 
 
+def infer_evaluator_name(data_path: str, explicit_evaluator: Optional[str] = None) -> str:
+    if explicit_evaluator is not None:
+        return explicit_evaluator
+
+    dataset_name = Path(data_path).name.lower()
+    if "sudoku" in dataset_name:
+        return "sudoku@Sudoku"
+
+    return "arc@ARC"
+
+
 def setup_distributed():
     """Initialize distributed training if in distributed environment."""
     rank = 0
@@ -460,6 +471,12 @@ def main():
         help="Use aggregated voting across augmentations"
     )
     parser.add_argument(
+        "--evaluator",
+        type=str,
+        default=None,
+        help="Evaluator identifier in module@class form. Defaults to sudoku@Sudoku for Sudoku datasets and arc@ARC otherwise.",
+    )
+    parser.add_argument(
         "--loop-extrapolation",
         action="store_true",
         help="Evaluate the checkpoint with additional loop counts beyond training",
@@ -481,16 +498,21 @@ def main():
     #     pass_ks = [1]
         # pass_ks = [1, 2, 5, 10, 100, 1000]
 
-    config_overrides = {
-        "global_batch_size": args.batch_size,
-        "evaluators": [
+    evaluator_name = infer_evaluator_name(args.data_path, args.evaluator)
+
+    evaluator_cfg = {"name": evaluator_name}
+    if evaluator_name.lower().endswith("@arc") or evaluator_name.lower() in {"arc", "arc@arc"}:
+        evaluator_cfg.update(
             {
-                "name": "ARC",
                 "submission_K": args.submission_k,
                 "aggregated_voting": args.aggregated_voting,
-                "pass_Ks": pass_ks
+                "pass_Ks": pass_ks,
             }
-        ]
+        )
+
+    config_overrides = {
+        "global_batch_size": args.batch_size,
+        "evaluators": [evaluator_cfg],
     }
 
     evaluate_checkpoint(
