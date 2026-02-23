@@ -1,3 +1,4 @@
+optimizer_name="schedulefree"
 run_name="TARM-sudoku"
 checkpoint_path="checkpoints/${run_name}" 
 mkdir -p $checkpoint_path
@@ -14,4 +15,5 @@ torchrun --nproc-per-node $SLURM_GPUS_ON_NODE pretrain.py \
     +load_checkpoint=$HOME/TropicalURM/URM/checkpoints/URM-sudoku/step_83325.pt \
     +load_filter_mismatched_shapes=True \
     +load_optimizer_state=False \
+    optimizer_name=$optimizer_name \
 

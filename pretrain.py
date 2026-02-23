@@ -29,6 +29,11 @@ from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 
 from torch.nn.parallel import DistributedDataParallel as DDP # added
 
+try:
+    from schedulefree import AdamWScheduleFree
+except ImportError:
+    AdamWScheduleFree = None
+
 def unwrap(m: nn.Module) -> nn.Module:
     return m.module if hasattr(m, "module") else m
 
@@ -144,6 +149,7 @@ class PretrainConfig(pydantic.BaseModel):
     ema_rate: float = 0.999
 
     use_muon: bool = False
+    optimizer_name: str = "adam_atan2"
 
 
 
@@ -240,6 +246,36 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             ]),
         ]
     else:
+        if config.optimizer_name == "schedulefree":
+            if AdamWScheduleFree is None:
+                raise ImportError(
+                    "optimizer_name='schedulefree' requires the 'schedulefree' package. "
+                    "Install dependencies from requirements.txt."
+                )
+
+            main_optimizer = AdamWScheduleFree(
+                model.parameters(),
+                lr=config.lr,
+                weight_decay=config.weight_decay,
+                betas=(config.beta1, config.beta2),
+                warmup_steps=round(config.lr_warmup_steps),
+            )
+            optimizer_lrs = [config.puzzle_emb_lr, config.lr]
+        elif config.optimizer_name == "adam_atan2":
+            main_optimizer = AdamAtan2(
+                model.parameters(),
+                lr=0.00001,  # Needs to be set by scheduler
+                weight_decay=config.weight_decay,
+                betas=(config.beta1, config.beta2),
+            )
+            optimizer_lrs = [config.puzzle_emb_lr, config.lr]
+        else:
+            raise ValueError(
+                "Unsupported optimizer_name='{}' (expected one of: adam_atan2, schedulefree)".format(
+                    config.optimizer_name
+                )
+            )
+
         optimizers = [
             CastedSparseEmbeddingSignSGD_Distributed(
                 model.model.puzzle_emb.buffers(),  # type: ignore
@@ -247,15 +283,11 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 weight_decay=config.puzzle_emb_weight_decay,
                 world_size=world_size,
             ),
-            AdamAtan2(
-                model.parameters(),
-                lr=0.00001,  # Needs to be set by scheduler
-                weight_decay=config.weight_decay,
-                betas=(config.beta1, config.beta2),
-            ),
+            main_optimizer,
         ]
 
-    optimizer_lrs = [config.puzzle_emb_lr, config.lr]
+    if config.use_muon:
+        optimizer_lrs = [config.puzzle_emb_lr, config.lr]
 
     return model, optimizers, optimizer_lrs
 
@@ -618,6 +650,10 @@ def train_batch(
         with torch.device("cuda"):
             train_state.carry = unwrap(train_state.model).initial_carry(batch)  # type: ignore #unwrap
 
+    for optimizer in train_state.optimizers:
+        if hasattr(optimizer, "train"):
+            optimizer.train()
+
     # Forward
     compute_target_q = train_state.step % config.target_q_update_every == 0
     train_state.carry, loss, metrics, _, _ = train_state.model(
@@ -647,7 +683,11 @@ def train_batch(
     # Apply optimizer
     lr_this_step = None
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
-        lr_this_step = compute_lr(base_lr, config, train_state)
+        is_schedulefree = AdamWScheduleFree is not None and isinstance(optim, AdamWScheduleFree)
+        if is_schedulefree:
+            lr_this_step = base_lr
+        else:
+            lr_this_step = compute_lr(base_lr, config, train_state)
 
         for param_group in optim.param_groups:
             param_group["lr"] = lr_this_step
@@ -701,6 +741,10 @@ def evaluate(
     reduced_metrics = None
 
     with torch.inference_mode():
+        for optimizer in train_state.optimizers:
+            if hasattr(optimizer, "eval"):
+                optimizer.eval()
+
         return_keys = set(config.eval_save_outputs)
         for evaluator in evaluators:
             evaluator.begin_eval()
