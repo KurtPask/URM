@@ -39,3 +39,4 @@ puzzle_emb_weight_decay: 0.1
 puzzle_emb_lr: 1e-2
 
 use_muon: False
+optimizer_name: adam_atan2

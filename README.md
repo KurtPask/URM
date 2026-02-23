@@ -104,3 +104,12 @@ Notes:
       url={https://arxiv.org/abs/2512.14693}, 
 }
 ```
+
+## Optimizer choice for pretraining
+You can now choose the pretraining optimizer via Hydra:
+```bash
+python pretrain.py ... optimizer_name=adam_atan2   # default
+python pretrain.py ... optimizer_name=schedulefree
+```
+
+For TARM Sudoku runs, `scripts/TARM_sudoku.sh` now defaults to `optimizer_name="schedulefree"` (override by changing that variable).
