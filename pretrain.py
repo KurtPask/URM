@@ -427,19 +427,35 @@ def load_config_from_checkpoint_path(path: str) -> Optional[PretrainConfig]:
 
 
 def _resize_puzzle_embedding_if_needed(model: nn.Module, state_dict: dict):
-    puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
-    expected_shape: torch.Size = model.model.puzzle_emb.weights.shape  # type: ignore
-    if puzzle_emb_name in state_dict:
-        puzzle_emb = state_dict[puzzle_emb_name]
-        if puzzle_emb.shape != expected_shape:
-            print(
-                f"Resetting puzzle embedding as shape is different. Found {puzzle_emb.shape}, Expected {expected_shape}"
-            )
+    # unwrap distributed/compiled wrappers if present
+    base_model = model
+    while hasattr(base_model, "module"):
+        base_model = base_model.module  # type: ignore[attr-defined]
 
-            # Re-initialize using mean
-            state_dict[puzzle_emb_name] = (
-                torch.mean(puzzle_emb, dim=0, keepdim=True).expand(expected_shape).contiguous()
-            )
+    puzzle_emb = getattr(getattr(base_model, "model", None), "puzzle_emb", None)
+    if puzzle_emb is None or not hasattr(puzzle_emb, "weights"):
+        return
+
+    expected_shape: torch.Size = puzzle_emb.weights.shape  # type: ignore[union-attr]
+    for puzzle_emb_name in [
+        "_orig_mod.model.inner.puzzle_emb.weights",
+        "model.inner.puzzle_emb.weights",
+        "module._orig_mod.model.inner.puzzle_emb.weights",
+        "module.model.inner.puzzle_emb.weights",
+    ]:
+        if puzzle_emb_name in state_dict:
+            loaded_puzzle_emb = state_dict[puzzle_emb_name]
+            if loaded_puzzle_emb.shape != expected_shape:
+                print(
+                    "Resetting puzzle embedding as shape is different. "
+                    f"Found {loaded_puzzle_emb.shape}, Expected {expected_shape}"
+                )
+
+                # Re-initialize using mean
+                state_dict[puzzle_emb_name] = (
+                    torch.mean(loaded_puzzle_emb, dim=0, keepdim=True).expand(expected_shape).contiguous()
+                )
+            break
 
 
 def _filter_state_dict_for_model(model: nn.Module, state_dict: dict, rank: int) -> dict:
