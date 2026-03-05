@@ -172,14 +172,14 @@ class DeepSet(nn.Module):
         super().__init__()
         hidden = dim if hidden_dim is None else hidden_dim
         self.phi = nn.Sequential(
-            nn.Linear(dim, hidden, bias=True),
+            CastedLinear(dim, hidden, bias=True),
             nn.SiLU(),
-            nn.Linear(hidden, dim, bias=True),
+            CastedLinear(hidden, dim, bias=True),
         )
         self.rho = nn.Sequential(
-            nn.Linear(dim, hidden, bias=True),
+            CastedLinear(dim, hidden, bias=True),
             nn.SiLU(),
-            nn.Linear(hidden, dim, bias=True),
+            CastedLinear(hidden, dim, bias=True),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -228,7 +228,7 @@ class TropicalAttention(nn.Module):
         self.causal = causal
         self.attn_dropout = attn_dropout
 
-        self.out = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.out = CastedLinear(hidden_size, hidden_size, bias=False)
         self.q_dropout = nn.Dropout(q_dropout)
         self.k_dropout = nn.Dropout(k_dropout)
         self.v_dropout = nn.Dropout(v_dropout)
