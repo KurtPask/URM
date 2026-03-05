@@ -255,6 +255,45 @@ class TropicalAttention(nn.Module):
             return x - self.deepset(x)
         raise ValueError("Invalid tropical_norm.")
 
+    def _apply_tropical_feature_dropout(
+        self, diff: torch.Tensor, keep_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply dropout on feature coordinates for symmetric tropical distance.
+
+        Standard nn.Dropout on q/k is not appropriate here because zeroed coordinates
+        can still be selected by max/min reductions and thus still influence both the
+        forward tropical distance and backward gradients. Instead, we mask `diff`
+        directly before reduction and exclude dropped coordinates from selection by
+        setting them to +/-inf in the max/min branches.
+        """
+        q_keep = 1.0 - self.q_dropout.p
+        k_keep = 1.0 - self.k_dropout.p
+        # A feature coordinate is considered dropped if either q or k would have
+        # dropped it under independent Bernoulli masks.
+        keep_prob = q_keep * k_keep
+        drop_prob = 1.0 - keep_prob
+
+        if (not self.training) or drop_prob <= 0.0:
+            return diff, diff
+
+        if keep_mask is None:
+            keep_mask = torch.rand_like(diff) < keep_prob
+        else:
+            keep_mask = keep_mask.to(device=diff.device, dtype=torch.bool)
+            if keep_mask.shape != diff.shape:
+                raise ValueError("keep_mask must have the same shape as diff.")
+
+        # Ensure numerical safety: if all coordinates are dropped for a reduction row,
+        # restore that row to the unmasked diff so reductions remain finite.
+        all_dropped = ~keep_mask.any(dim=-1, keepdim=True)
+        if all_dropped.any():
+            keep_mask = torch.where(all_dropped, torch.ones_like(keep_mask), keep_mask)
+
+        diff_max = diff.masked_fill(~keep_mask, float("-inf"))
+        diff_min = diff.masked_fill(~keep_mask, float("inf"))
+        return diff_max, diff_min
+
     def forward_with_scores(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.size()
 
@@ -284,14 +323,16 @@ class TropicalAttention(nn.Module):
             k = self.key_trop(k)
             v = self.value_trop(v)
 
-        q = self.q_dropout(q)
-        k = self.k_dropout(k)
+        if not self.symmetric:
+            q = self.q_dropout(q)
+            k = self.k_dropout(k)
         v = self.v_dropout(v)
 
         if self.symmetric:
             diff = q.unsqueeze(2) - k.unsqueeze(1)
-            max_diff, _ = diff.max(dim=-1)
-            min_diff, _ = diff.min(dim=-1)
+            diff_max, diff_min = self._apply_tropical_feature_dropout(diff)
+            max_diff = diff_max.amax(dim=-1)
+            min_diff = diff_min.amin(dim=-1)
             d_trop = max_diff - min_diff
             attn_scores = -d_trop
         else:
