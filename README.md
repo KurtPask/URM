@@ -105,6 +105,16 @@ Notes:
 }
 ```
 
+
+## Comparing URM vs TARM q-head logits
+```bash
+bash scripts/compare_q_head_logits.sh   checkpoints/URM/step_83325.pt   checkpoints/TARM/step_83325.pt   data/sudoku-extreme-1k-aug-1000   --split test --num-batches 50 --batch-size 64
+```
+
+This runs `analyze_q_head_logits.py`, prints summary statistics for `q_halt_logits`
+and `q_continue_logits`, and saves an overlay histogram plot at
+`analysis/q_head_logits_comparison.png` (override with `--output-plot`).
+
 ## Optimizer choice for pretraining
 You can now choose the pretraining optimizer via Hydra:
 ```bash
