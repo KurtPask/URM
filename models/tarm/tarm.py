@@ -6,7 +6,15 @@ import torch.nn.functional as F
 from torch import nn
 from pydantic import BaseModel
 from models.common import trunc_normal_init_
-from models.layers import rms_norm, ConvSwiGLU, CastedEmbedding, CastedLinear, TropicalAttention
+from models.layers import (
+    rms_norm,
+    ConvSwiGLU,
+    RotaryEmbedding,
+    CosSin,
+    CastedEmbedding,
+    CastedLinear,
+    TropicalAttention,
+)
 from models.sparse_embedding import CastedSparseEmbedding
 
 
@@ -67,8 +75,8 @@ class TARMBlock(nn.Module):
         )
         self.norm_eps = config.rms_norm_eps
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        attn_output = self.self_attn(cos_sin=None, hidden_states=hidden_states)
+    def forward(self, cos_sin: Optional[CosSin], hidden_states: torch.Tensor) -> torch.Tensor:
+        attn_output = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
         hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
         mlp_output = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
@@ -92,6 +100,7 @@ class TARM_Inner(nn.Module):
         self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True)
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)
+        self.pos_encoding_mode = self._resolve_pos_encoding_mode(self.config.pos_encodings)
 
         if self.config.puzzle_emb_ndim > 0:
             self.puzzle_emb = CastedSparseEmbedding(
@@ -102,15 +111,19 @@ class TARM_Inner(nn.Module):
                 cast_to=self.forward_dtype,
             )
 
-        if self.config.pos_encodings == "learned":
+        if self.pos_encoding_mode == "learned":
             self.embed_pos = CastedEmbedding(
                 self.config.seq_len + self.puzzle_emb_len,
                 self.config.hidden_size,
                 init_std=embed_init_std,
                 cast_to=self.forward_dtype,
             )
-        else:
-            pass
+        elif self.pos_encoding_mode == "rope":
+            self.rotary_emb = RotaryEmbedding(
+                dim=self.config.hidden_size // self.config.num_heads,
+                max_position_embeddings=self.config.seq_len + self.puzzle_emb_len,
+                base=self.config.rope_theta,
+            )
 
         self.layers = nn.ModuleList([TARMBlock(self.config) for _ in range(self.config.num_layers)])
 
@@ -122,6 +135,16 @@ class TARM_Inner(nn.Module):
         with torch.no_grad():
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)
+
+    @staticmethod
+    def _resolve_pos_encoding_mode(pos_encodings: str) -> str:
+        aliases = {
+            "learnable": "learned",
+        }
+        mode = aliases.get(pos_encodings, pos_encodings)
+        if mode not in {"learned", "rope", "none"}:
+            raise ValueError("pos_encodings must be one of: 'learned', 'learnable', 'rope', 'none'.")
+        return mode
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         embedding = self.embed_tokens(input.to(torch.int32))
@@ -135,7 +158,7 @@ class TARM_Inner(nn.Module):
                 (puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding),
                 dim=-2,
             )
-        if self.config.pos_encodings == "learned":
+        if self.pos_encoding_mode == "learned":
             embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight.to(self.forward_dtype))
 
         return self.embed_scale * embedding
@@ -163,6 +186,11 @@ class TARM_Inner(nn.Module):
         carry: TARMCarry,
         batch: Dict[str, torch.Tensor]
     ) -> Tuple[TARMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.pos_encoding_mode == "rope":
+            seq_info = dict(cos_sin=self.rotary_emb())
+        else:
+            seq_info = dict(cos_sin=None)
+
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         hidden_states = carry.current_hidden
@@ -172,12 +200,12 @@ class TARM_Inner(nn.Module):
                     for _ in range(self.config.L_cycles):
                         hidden_states = hidden_states + input_embeddings
                         for layer in self.layers:
-                            hidden_states = layer(hidden_states=hidden_states)
+                            hidden_states = layer(hidden_states=hidden_states, **seq_info)
 
         for _ in range(self.config.L_cycles):
             hidden_states = hidden_states + input_embeddings
             for layer in self.layers:
-                hidden_states = layer(hidden_states=hidden_states)
+                hidden_states = layer(hidden_states=hidden_states, **seq_info)
 
         new_carry = replace(carry, current_hidden=hidden_states.detach())
         output = self.lm_head(hidden_states)[:, self.puzzle_emb_len:]

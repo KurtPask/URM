@@ -14,7 +14,10 @@ num_heads: 4
 expansion: 4
 
 puzzle_emb_ndim: ${.hidden_size}
+# Allowed values: learned | learnable (alias of learned) | rope | none
 pos_encodings: learnable
+# Example override for URM-vs-TARM ablations:
+# pos_encodings: rope
 
 # Tropical attention options
 tropical_proj: true
