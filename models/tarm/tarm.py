@@ -163,21 +163,27 @@ class TARM_Inner(nn.Module):
 
         return self.embed_scale * embedding
 
-    def empty_carry(self, batch_size: int) -> TARMCarry:
+    def empty_carry(self, batch_size: int, device: torch.device | None = None) -> TARMCarry:
+        if device is None:
+            device = self.init_hidden.device
         return TARMCarry(
             current_hidden=torch.empty(
                 batch_size,
                 self.config.seq_len + self.puzzle_emb_len,
                 self.config.hidden_size,
                 dtype=self.forward_dtype,
+                device=device,
             ),
         )
 
     def reset_carry(self, reset_flag: torch.Tensor, carry: TARMCarry) -> TARMCarry:
+        device = carry.current_hidden.device
+        reset_flag = reset_flag.to(device)
+        init_hidden = self.init_hidden.to(device).view(1, 1, -1)
         new_hidden = torch.where(
             reset_flag.view(-1, 1, 1),
-            self.init_hidden,
-            carry.current_hidden
+            init_hidden,
+            carry.current_hidden,
         )
         return replace(carry, current_hidden=new_hidden)
 
@@ -225,11 +231,12 @@ class TARM(nn.Module):
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]) -> TARMCarry:
         batch_size = batch["inputs"].shape[0]
-        base = self.inner.empty_carry(batch_size)
+        device = batch["inputs"].device
+        base = self.inner.empty_carry(batch_size, device=device)
         return TARMCarry(
             current_hidden=base.current_hidden,
-            steps=torch.zeros((batch_size,), dtype=torch.int32),
-            halted=torch.ones((batch_size,), dtype=torch.bool),
+            steps=torch.zeros((batch_size,), dtype=torch.int32, device=device),
+            halted=torch.ones((batch_size,), dtype=torch.bool, device=device),
             current_data={k: torch.empty_like(v) for k, v in batch.items()},
         )
 

@@ -350,6 +350,10 @@ class TropicalAttention(nn.Module):
             n = q.size(-1)
             attn_scores = -(sum_diff - n * min_diff)
 
+        if attn_scores.size(-2) == attn_scores.size(-1):
+            T = attn_scores.size(-1)
+            self_mask = torch.eye(T, device=attn_scores.device, dtype=torch.bool)
+            attn_scores = attn_scores.masked_fill(self_mask, float("-inf"))
         sum_sv = attn_scores.unsqueeze(-1) + v.unsqueeze(1)
         context = sum_sv.max(dim=2).values
 

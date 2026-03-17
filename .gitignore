@@ -15,4 +15,4 @@ checkpoints/
 wandb_sync.sh
 gpu_check.sh
 /*.sh
-
+*.json

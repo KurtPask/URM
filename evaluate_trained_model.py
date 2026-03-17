@@ -42,7 +42,7 @@ from pretrain import (
     TrainState
 )
 from utils import load_model_class
-
+from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 
 def infer_evaluator_name(data_path: str, explicit_evaluator: Optional[str] = None) -> str:
     if explicit_evaluator is not None:
@@ -79,81 +79,40 @@ def setup_distributed():
 
 def load_config_from_checkpoint(checkpoint_path: Path) -> PretrainConfig:
     import yaml
-    import re
 
-    checkpoint_dir = checkpoint_path.parent
-    cfg_path = checkpoint_dir / "all_config.yaml"
-    raw = cfg_path.read_text()
+    cfg_path = checkpoint_path.parent / "config.yaml"
+    data = yaml.safe_load(cfg_path.read_text())
 
-    idx = raw.find("\nbeta1:")
-    if idx == -1:
-        raise RuntimeError("Cannot locate clean YAML block (beta1:)")
+    if not isinstance(data, dict):
+        raise TypeError(f"{cfg_path} did not parse to a dict")
 
-    clean_yaml = raw[idx+1:]
-    flat = yaml.safe_load(clean_yaml)
+    return PretrainConfig.model_validate(data)
 
-    # 提取 loops
-    m = re.search(r"\bloops:\s*(\d+)", raw)
-    loops = int(m.group(1)) if m else 16
 
-    # num_heads
-    m = re.search(r"\bnum_heads:\s*(\d+)", raw)
-    num_heads = int(m.group(1)) if m else 8
+def normalize_state_dict_for_model(model, state_dict):
+    """
+    Normalize common wrapper prefixes so checkpoint keys match the current model.
+    Handles DDP/DataParallel 'module.' prefix.
+    """
+    model_keys = list(model.state_dict().keys())
+    ckpt_keys = list(state_dict.keys())
 
-    # num_layers
-    m = re.search(r"\bnum_layers:\s*(\d+)", raw)
-    num_layers = int(m.group(1)) if m else 4
+    if not model_keys or not ckpt_keys:
+        return state_dict
 
-    # pos_encodings
-    m = re.search(r"\bpos_encodings:\s*(\w+)", raw)
-    pos_encodings = m.group(1) if m else "rope"
+    model_has_module = model_keys[0].startswith("module.")
+    ckpt_has_module = ckpt_keys[0].startswith("module.")
 
-    # puzzle_emb_ndim
-    m = re.search(r"\bpuzzle_emb_ndim:\s*(\d+)", raw)
-    puzzle_emb_ndim = int(m.group(1)) if m else 512
+    # Official DDP fix: strip 'module.' when loading DDP checkpoint into non-DDP model
+    if ckpt_has_module and not model_has_module:
+        consume_prefix_in_state_dict_if_present(state_dict, "module.")
+        return state_dict
 
-    # hidden_size
-    m = re.search(r"\bhidden_size:\s*(\d+)", raw)
-    hidden_size = int(m.group(1)) if m else puzzle_emb_ndim
+    # Reverse case: add 'module.' if model is wrapped but checkpoint is not
+    if model_has_module and not ckpt_has_module:
+        return {f"module.{k}": v for k, v in state_dict.items()}
 
-    # expansion
-    m = re.search(r"\bexpansion:\s*(\d+)", raw)
-    expansion = int(m.group(1)) if m else 4
-
-    # H_cycles
-    m = re.search(r"\bH_cycles:\s*(\d+)", raw)
-    H_cycles = int(m.group(1)) if m else 2
-
-    # L_cycles
-    m = re.search(r"\bL_cycles:\s*(\d+)", raw)
-    L_cycles = int(m.group(1)) if m else 6
-
-    arch_name = "urm.urm@URM"
-
-    arch_loss = {
-        "loss_type": "stablemax_cross_entropy",
-        "name": "losses@ACTLossHead"
-    }
-
-    arch = {
-        "H_cycles": H_cycles,
-        "L_cycles": L_cycles,
-        "expansion": expansion,
-        "hidden_size": hidden_size,
-        "loop_deltas": [0, 8],
-        "loops": loops,
-        "loss": arch_loss,
-        "name": arch_name,
-        "num_heads": num_heads,
-        "num_layers": num_layers,
-        "pos_encodings": pos_encodings,
-        "puzzle_emb_ndim": puzzle_emb_ndim,
-    }
-
-    flat["arch"] = arch
-
-    return PretrainConfig(**flat)
-
+    return state_dict
 
 def evaluate_checkpoint(
     checkpoint_path: str,
@@ -321,7 +280,24 @@ def evaluate_checkpoint(
         model, _, _ = create_model(loop_config, train_metadata, rank=rank, world_size=world_size)
 
         if rank == 0:
-            model.load_state_dict(state_dict, strict=True)
+            state_dict = normalize_state_dict_for_model(model, state_dict)
+
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if missing or unexpected:
+                print("\nState dict mismatch after normalization:")
+                print("Missing keys:")
+                for k in missing[:50]:
+                    print("  ", k)
+                if len(missing) > 50:
+                    print(f"  ... and {len(missing) - 50} more")
+
+                print("Unexpected keys:")
+                for k in unexpected[:50]:
+                    print("  ", k)
+                if len(unexpected) > 50:
+                    print(f"  ... and {len(unexpected) - 50} more")
+
+                raise RuntimeError("Checkpoint still does not match model after prefix normalization.")
 
         if world_size > 1:
             with torch.no_grad():
