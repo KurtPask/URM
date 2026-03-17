@@ -294,7 +294,7 @@ class TropicalAttention(nn.Module):
         diff_min = diff.masked_fill(~keep_mask, float("inf"))
         return diff_max, diff_min
 
-    def forward_with_scores(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward_with_scores(self, x: torch.Tensor, cos_sin: Optional[CosSin] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.size()
 
         x_pos = torch.log1p(F.relu(x))
@@ -309,9 +309,17 @@ class TropicalAttention(nn.Module):
             k = x_pos
             v = x_pos
 
-        q = q.reshape(batch_size, seq_len, self.n_heads, self.d_k).permute(0, 2, 1, 3)
-        k = k.reshape(batch_size, seq_len, self.n_heads, self.d_k).permute(0, 2, 1, 3)
-        v = v.reshape(batch_size, seq_len, self.n_heads, self.d_k).permute(0, 2, 1, 3)
+        q = q.reshape(batch_size, seq_len, self.n_heads, self.d_k)
+        k = k.reshape(batch_size, seq_len, self.n_heads, self.d_k)
+        v = v.reshape(batch_size, seq_len, self.n_heads, self.d_k)
+
+        if cos_sin is not None:
+            cos, sin = cos_sin
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
 
         B = batch_size * self.n_heads
         q = q.reshape(B, seq_len, self.d_k)
@@ -357,7 +365,7 @@ class TropicalAttention(nn.Module):
         return output, attn_scores
 
     def forward(self, cos_sin: Optional[CosSin], hidden_states: torch.Tensor) -> torch.Tensor:
-        output, _ = self.forward_with_scores(hidden_states)
+        output, _ = self.forward_with_scores(hidden_states, cos_sin=cos_sin)
         return output
 
 
