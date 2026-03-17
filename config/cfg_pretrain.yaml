@@ -40,3 +40,32 @@ puzzle_emb_lr: 1e-2
 
 use_muon: False
 optimizer_name: adam_atan2
+
+project_name: urm_tarm_activation_probe
+wandb_group: null
+wandb_tags: []
+wandb_job_type: null
+
+probe:
+  enabled: false
+  interval_steps: 100
+  histogram_interval_steps: 500
+  raw_save_interval_steps: 1000
+  save_dir: analysis/activation_probe
+  sample_examples: 2
+  sample_tokens: 16
+  sample_hidden_dims: 64
+  sample_output_vocab_dims: 128
+  flat_sample_size: 65536
+  max_hist_points: 32768
+  rank0_only: true
+  log_wandb_histograms: true
+  log_wandb_scalars: true
+  save_raw_locally: true
+  include_hidden_states: true
+  include_new_carry: true
+  include_output: true
+  include_q_logits: true
+  include_q_halt: true
+  include_q_continue: true
+  seed: 0

@@ -123,3 +123,57 @@ python pretrain.py ... optimizer_name=schedulefree
 ```
 
 For TARM Sudoku runs, `scripts/TARM_sudoku.sh` now defaults to `optimizer_name="schedulefree"` (override by changing that variable).
+
+## Activation probe mode (URM vs TARM)
+Probe mode captures pre-argmax/pre-threshold activation distributions during Sudoku pretraining for:
+- `hidden_states_final`
+- `new_carry_current_hidden`
+- `output_logits` (raw lm head output)
+- `q_logits_raw`
+- `q_halt_logits`
+- `q_continue_logits`
+
+It is disabled by default (`probe.enabled=false`). When enabled, `pretrain.py` automatically skips `torch.compile` to keep probe instrumentation safe/reliable.
+
+### Run URM-only probe
+```bash
+bash scripts/URM_sudoku_probe.sh
+```
+
+### Run TARM-only probe
+```bash
+bash scripts/TARM_sudoku_probe.sh
+```
+
+### Run sequential URM then TARM probe (single HPC entrypoint)
+```bash
+bash scripts/profile_urm_vs_tarm_sudoku.sh
+```
+
+### Local saved samples
+Raw sampled tensors and summaries are saved under:
+```text
+analysis/activation_probe/<run_name>/step_<global_step>/
+```
+with:
+- `summary.pt`
+- `raw_samples.pt`
+- `metadata.json`
+
+### W&B logging
+Scalars are logged under `probe/<tensor>/<stat>` and histograms (interval-gated) under `probe_hist/<tensor>`.
+Use Hydra overrides like:
+```bash
+probe.enabled=true probe.interval_steps=100 probe.histogram_interval_steps=500 probe.raw_save_interval_steps=1000
+project_name=urm_tarm_activation_probe wandb_group=my_group wandb_tags='[sudoku,probe]'
+```
+
+### Offline helper
+```bash
+python analyze_activation_probe.py \
+  --urm-dir analysis/activation_probe/URM-sudoku-probe \
+  --tarm-dir analysis/activation_probe/TARM-sudoku-probe \
+  --step 1000 \
+  --tensor hidden_states_final
+```
+Probe mode adds overhead and is intended for diagnostics rather than full-speed long pretraining.

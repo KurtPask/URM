@@ -107,6 +107,8 @@ class URM_Inner(nn.Module):
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)
 
+        self.activation_probe = None
+
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         embedding = self.embed_tokens(input.to(torch.int32))
 
@@ -170,7 +172,19 @@ class URM_Inner(nn.Module):
         new_carry = replace(carry, current_hidden=hidden_states.detach())
         output = self.lm_head(hidden_states)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(hidden_states[:, 0]).to(torch.float32)
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+        q_halt_logits = q_logits[..., 0]
+        q_continue_logits = q_logits[..., 1]
+
+        probe = getattr(self, "activation_probe", None)
+        if probe is not None:
+            probe.record_tensor("hidden_states_final", hidden_states)
+            probe.record_tensor("new_carry_current_hidden", new_carry.current_hidden)
+            probe.record_tensor("output_logits", output)
+            probe.record_tensor("q_logits_raw", q_logits)
+            probe.record_tensor("q_halt_logits", q_halt_logits)
+            probe.record_tensor("q_continue_logits", q_continue_logits)
+
+        return new_carry, output, (q_halt_logits, q_continue_logits)
 
 
 class URM(nn.Module):

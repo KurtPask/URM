@@ -29,6 +29,8 @@ from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 
 from torch.nn.parallel import DistributedDataParallel as DDP # added
 
+from activation_probe import ActivationProbe, ActivationProbeConfig
+
 try:
     from schedulefree import AdamWScheduleFree
 except ImportError:
@@ -95,6 +97,32 @@ class EvaluatorConfig(pydantic.BaseModel):
     name: str
 
 
+
+
+class ProbeConfig(pydantic.BaseModel):
+    enabled: bool = False
+    interval_steps: int = 100
+    histogram_interval_steps: int = 500
+    raw_save_interval_steps: int = 1000
+    save_dir: str = "analysis/activation_probe"
+    sample_examples: int = 2
+    sample_tokens: int = 16
+    sample_hidden_dims: int = 64
+    sample_output_vocab_dims: int = 128
+    flat_sample_size: int = 65536
+    max_hist_points: int = 32768
+    rank0_only: bool = True
+    log_wandb_histograms: bool = True
+    log_wandb_scalars: bool = True
+    save_raw_locally: bool = True
+    include_hidden_states: bool = True
+    include_new_carry: bool = True
+    include_output: bool = True
+    include_q_logits: bool = True
+    include_q_halt: bool = True
+    include_q_continue: bool = True
+    seed: int = 0
+
 class PretrainConfig(pydantic.BaseModel):
     # Config
     arch: ArchConfig
@@ -125,9 +153,14 @@ class PretrainConfig(pydantic.BaseModel):
     grad_accum_steps: int = 1
 
     # Names
-    project_name: Optional[str] = None
+    project_name: Optional[str] = "urm_tarm_activation_probe"
     run_name: Optional[str] = None
     checkpoint_path: Optional[str] = None
+    wandb_group: Optional[str] = None
+    wandb_tags: List[str] = []
+    wandb_job_type: Optional[str] = None
+
+    probe: ProbeConfig = ProbeConfig()
 
     # Extras
     load_checkpoint: Optional[str] = None
@@ -199,6 +232,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         should_compile = (
             "DISABLE_COMPILE" not in os.environ
             and (model_config is None or not getattr(model_config, "profile", False))
+            and (not config.probe.enabled)
         )
         if should_compile:
             model = torch.compile(model, dynamic=False)  # type: ignore
@@ -653,6 +687,7 @@ def train_batch(
     global_batch_size: int,
     rank: int,
     world_size: int,
+    activation_probe: Optional[ActivationProbe] = None,
 ):
     accum_steps = max(1, getattr(config, "grad_accum_steps", 1))
     if train_state.step >= train_state.total_steps:  # At most train_total_steps
@@ -671,6 +706,14 @@ def train_batch(
             optimizer.train()
 
     # Forward
+    if activation_probe is not None:
+        activation_probe.set_context(
+            split="train",
+            global_step=train_state.step,
+            run_name=config.run_name or "unnamed_run",
+            arch_name=config.arch.name,
+        )
+
     compute_target_q = train_state.step % config.target_q_update_every == 0
     train_state.carry, loss, metrics, _, _ = train_state.model(
         carry=train_state.carry, batch=batch, return_keys=[], compute_target_q=compute_target_q
@@ -713,6 +756,9 @@ def train_batch(
 
     train_state.step += 1
     train_state.accum_step = 0
+
+    if activation_probe is not None:
+        activation_probe.finalize_step()
 
     # Reduce metrics
     if len(metrics):
@@ -948,7 +994,6 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
     objects = [None]
     if rank == 0:
         config = PretrainConfig(**hydra_config)  # type: ignore
-        config.project_name = "arcagi"
 
         objects = [config]
 
@@ -963,6 +1008,7 @@ def launch(hydra_config: DictConfig):
     RANK = 0
     WORLD_SIZE = 1
     CPU_PROCESS_GROUP = None
+    LOCAL_RANK = 0
 
     # Initialize distributed training if in distributed environment (e.g. torchrun)
     if "LOCAL_RANK" in os.environ:
@@ -1026,6 +1072,15 @@ def launch(hydra_config: DictConfig):
     # Train state
     train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE, local_rank=LOCAL_RANK)
 
+    activation_probe = None
+    if config.probe.enabled:
+        activation_probe = ActivationProbe(ActivationProbeConfig(**config.probe.model_dump()), rank=RANK)
+        inner_module = getattr(getattr(unwrap(train_state.model), "model", None), "inner", None)
+        if inner_module is not None:
+            inner_module.activation_probe = activation_probe
+        if RANK == 0:
+            print("Activation probe enabled; torch.compile is disabled for this run.")
+
     ema_helper = None
     if config.ema:
         if RANK == 0:
@@ -1043,6 +1098,9 @@ def launch(hydra_config: DictConfig):
         wandb.init(
             project=config.project_name,
             name=config.run_name,
+            group=config.wandb_group,
+            tags=config.wandb_tags,
+            job_type=config.wandb_job_type,
             config=config.model_dump(),
             settings=wandb.Settings(_disable_stats=True),
         )
@@ -1067,7 +1125,7 @@ def launch(hydra_config: DictConfig):
 
         for set_name, batch, global_batch_size in train_loader:
             metrics = train_batch(
-                config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE
+                config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE, activation_probe=activation_probe
             )
 
             # EMA update
@@ -1133,7 +1191,8 @@ def launch(hydra_config: DictConfig):
     # finalize
     if dist.is_initialized():
         dist.destroy_process_group()
-    wandb.finish()
+    if RANK == 0:
+        wandb.finish()
 
 
 if __name__ == "__main__":
