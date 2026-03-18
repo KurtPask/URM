@@ -1,14 +1,16 @@
-optimizer_name="schedulefree"
-run_name="TARM-sudoku_pos_embed_learned_dim64_projections"
+optimizer_name="adam_atan2"  #"schedulefree"
+run_name="TARM-sudoku_v2"
 checkpoint_path="checkpoints/${run_name}" 
 mkdir -p $checkpoint_path
 
-torchrun --nproc-per-node $SLURM_GPUS_ON_NODE pretrain.py \
+export MASTER_PORT=$((20000 + (${SLURM_JOB_ID:-$$} % 20000)))
+torchrun --nproc-per-node $SLURM_GPUS_ON_NODE --master_port=${MASTER_PORT} pretrain.py \
     data_path=$HOME/TropicalURM/URM/data/sudoku-extreme-1k-aug-1000 \
-    arch=tarm arch.loops=16 arch.H_cycles=2 arch.L_cycles=6 arch.hidden_size=64 \
+    arch=tarm arch.loops=16 arch.H_cycles=2 arch.L_cycles=6 arch.hidden_size=512 \
     epochs=50000 \
     eval_interval=2000 \
-    lr=1e-3 puzzle_emb_lr=1e-4 weight_decay=0.1 puzzle_emb_weight_decay=1.0 global_batch_size=100 \
+    project_name=arcagi \
+    lr=1e-4 puzzle_emb_lr=1e-4 weight_decay=1.0 puzzle_emb_weight_decay=1.0 global_batch_size=100 \
     +run_name=$run_name \
     +checkpoint_path=$checkpoint_path \
     +ema=True \

@@ -20,11 +20,11 @@ pos_encodings: rope
 # pos_encodings: rope
 
 # Tropical attention options
-tropical_proj: false
-tropical_qkv_proj: true
-tropical_norm: none
-q_dropout: 0.05
-k_dropout: 0.05
-v_dropout: 0.05
+# tropical_proj: false
+# tropical_qkv_proj: true
+# tropical_norm: none
+# q_dropout: 0.0
+# k_dropout: 0.0
+# v_dropout: 0.0
 
 forward_dtype: bfloat16

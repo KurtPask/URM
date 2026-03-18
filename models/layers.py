@@ -136,6 +136,60 @@ class Attention(nn.Module):
         return self.o_proj(attn_output)
 
 
+class TropicalAttentionV2(nn.Module):
+    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False, attn_dropout=0.0, **kwargs):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.head_dim = head_dim
+        self.output_size = head_dim * num_heads
+        self.num_heads = num_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.causal = causal
+
+        self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
+        self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
+
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = hidden_states.shape
+
+        # hidden_states: [bs, seq_len, num_heads, head_dim]
+        qkv = self.qkv_proj(hidden_states)
+
+        # Split head
+        qkv = qkv.view(batch_size, seq_len, self.num_heads + 2 * self.num_key_value_heads, self.head_dim) # [bs, seq_len, num_heads + 2 * num_key_value_heads, head_dim]
+        query = qkv[:, :, :self.num_heads] # [bs, seq_len, num_heads, head_dim]
+        key = qkv[:, :, self.num_heads: self.num_heads + self.num_key_value_heads] # [bs, seq_len, num_key_value_heads, head_dim]
+        value = qkv[:, :, self.num_heads + self.num_key_value_heads:] # [bs, seq_len, num_key_value_heads, head_dim]
+
+        # RoPE
+        if cos_sin is not None:
+            cos, sin = cos_sin
+            query, key = apply_rotary_pos_emb(query, key, cos, sin) # each: [bs, seq_len, num_heads, head_dim]
+
+        # flash attn
+        # attn_output = flash_attn_func(q=query, k=key, v=value, causal=self.causal)
+        # if isinstance(attn_output, tuple):  # fa2 and fa3 compatibility
+        #     attn_output = attn_output[0]
+
+        ######
+        q_t = torch.log1p(F.relu(query.to(torch.float32))) # [bs, seq_len, num_heads, head_dim]
+        k_t = torch.log1p(F.relu(key.to(torch.float32)))# [bs, seq_len, num_heads, head_dim]
+        v_t = torch.log1p(F.relu(value.to(torch.float32))) # [bs, seq_len, num_heads, head_dim]
+
+        diff = q_t.unsqueeze(2) - k_t.unsqueeze(1) # [bs, q_seq_len, k_seq_len, num_heads, head_dim]
+        max_diff = diff.amax(dim=-1) # [bs, q_seq_len, k_seq_len, num_heads]
+        min_diff = diff.amin(dim=-1) # [bs, q_seq_len, k_seq_len, num_heads]
+        attn_scores = -(max_diff - min_diff) # [bs, q_seq_len, k_seq_len, num_heads]
+        sum_sv = attn_scores.unsqueeze(-1) + v_t.unsqueeze(1) # [bs, q_seq_len, k_seq_len, num_heads, head_dim]
+        context = sum_sv.max(dim=2).values # [bs, q_seq_len, num_heads, head_dim]
+        attn_output = torch.expm1(context).to(hidden_states.dtype) # [bs, q_seq_len, num_heads, head_dim]
+        ######
+
+        # attn_output: [batch_size, num_heads, seq_len, head_dim]
+        attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # [bs, seq_len, num_heads * head_dim]
+        return self.o_proj(attn_output) # [bs, seq_len, hidden_size]
+
 class TropicalLinear(nn.Module):
     def __init__(
         self,
@@ -350,10 +404,6 @@ class TropicalAttention(nn.Module):
             n = q.size(-1)
             attn_scores = -(sum_diff - n * min_diff)
 
-        if attn_scores.size(-2) == attn_scores.size(-1):
-            T = attn_scores.size(-1)
-            self_mask = torch.eye(T, device=attn_scores.device, dtype=torch.bool)
-            attn_scores = attn_scores.masked_fill(self_mask, float("-inf"))
         sum_sv = attn_scores.unsqueeze(-1) + v.unsqueeze(1)
         context = sum_sv.max(dim=2).values
 

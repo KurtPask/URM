@@ -9,10 +9,11 @@ if [ -n "$WANDB_API_KEY" ]; then
   wandb login "$WANDB_API_KEY" || true
 fi
 
-torchrun --nproc-per-node ${SLURM_GPUS_ON_NODE:-2} pretrain.py \
+export MASTER_PORT=$((20000 + (${SLURM_JOB_ID:-$$} % 20000)))
+torchrun --nproc-per-node ${SLURM_GPUS_ON_NODE:-2} --master_port=${MASTER_PORT} pretrain.py \
   data_path=$HOME/TropicalURM/URM/data/sudoku-extreme-1k-aug-1000 \
-  arch=tarm arch.loops=16 arch.H_cycles=2 arch.L_cycles=6 arch.hidden_size=64 \
-  epochs=50000 eval_interval=2000 \
+  arch=tarm arch.loops=16 arch.H_cycles=2 arch.L_cycles=6 arch.hidden_size=512 \
+  epochs=2500 eval_interval=100 \
   lr=1e-3 puzzle_emb_lr=1e-4 weight_decay=0.1 puzzle_emb_weight_decay=1.0 global_batch_size=100 \
   +run_name=$run_name +checkpoint_path=$checkpoint_path +ema=True \
   optimizer_name=$optimizer_name \
