@@ -48,6 +48,8 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
 
     rank: int
     num_replicas: int
+    max_test_examples_per_set: int | None = None
+    test_example_stride: int = 1
 
 
 class PuzzleDataset(IterableDataset):
@@ -121,28 +123,29 @@ class PuzzleDataset(IterableDataset):
     def _iter_test(self):
         for set_name, dataset in self._data.items():  # type: ignore
             total_examples = len(dataset["inputs"])
+            stride = max(1, int(self.config.test_example_stride))
+            selected_indices = np.arange(0, total_examples, stride, dtype=np.int64)
+
+            if self.config.max_test_examples_per_set is not None:
+                max_examples = max(0, int(self.config.max_test_examples_per_set))
+                selected_indices = selected_indices[:max_examples]
 
             # Load examples one by one
             start_index = 0
-            while start_index < total_examples:
+            while start_index < selected_indices.size:
                 # Compute indices
-                end_index = min(total_examples, start_index + self.config.global_batch_size)
+                end_index = min(selected_indices.size, start_index + self.config.global_batch_size)
                 
                 local_start = start_index + self.config.rank * self.local_batch_size
                 local_end   = min(start_index + (self.config.rank + 1) * self.local_batch_size, end_index)
+                local_indices = selected_indices[local_start:local_end]
                 
                 # Get batch of examples, and also puzzle IDs
-                puzzle_indices = []
-                puzzle_index = np.searchsorted(dataset["puzzle_indices"], local_start, side="right") - 1
-                for i in range(local_start, local_end):
-                    while puzzle_index + 1 < len(dataset["puzzle_indices"]) and i >= dataset["puzzle_indices"][puzzle_index + 1]:
-                        puzzle_index += 1
-
-                    puzzle_indices.append(puzzle_index)
+                puzzle_indices = np.searchsorted(dataset["puzzle_indices"], local_indices, side="right") - 1
                 
                 batch = self._collate_batch({
-                    "inputs": dataset["inputs"][local_start: local_end],
-                    "labels": dataset["labels"][local_start: local_end],
+                    "inputs": dataset["inputs"][local_indices],
+                    "labels": dataset["labels"][local_indices],
                     "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices]
                 })
 

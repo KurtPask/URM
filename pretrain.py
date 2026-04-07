@@ -175,6 +175,9 @@ class PretrainConfig(pydantic.BaseModel):
     checkpoint_every_eval: bool = False
     eval_interval: Optional[int] = None
     eval_save_outputs: List[str] = []
+    eval_max_examples_per_set: Optional[int] = None
+    eval_example_stride: int = 1
+    eval_log_every_n_batches: int = 0
 
     loop_deltas: List[str] = []
 
@@ -201,7 +204,13 @@ class TrainState:
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
     dataset = PuzzleDataset(
         PuzzleDatasetConfig(
-            seed=config.seed, dataset_path=config.data_path, rank=rank, num_replicas=world_size, **kwargs
+            seed=config.seed,
+            dataset_path=config.data_path,
+            rank=rank,
+            num_replicas=world_size,
+            max_test_examples_per_set=config.eval_max_examples_per_set,
+            test_example_stride=config.eval_example_stride,
+            **kwargs,
         ),
         split=split,
     )
@@ -825,7 +834,9 @@ def evaluate(
         
         for set_name, batch, global_batch_size in eval_loader:
             processed_batches += 1
-            if rank == 0:
+            if rank == 0 and config.eval_log_every_n_batches > 0 and (
+                processed_batches == 1 or processed_batches % config.eval_log_every_n_batches == 0
+            ):
                 print(f"Processing batch {processed_batches}: {set_name}")
             
             # To device
@@ -844,7 +855,9 @@ def evaluate(
                 if all_finish:
                     break
 
-            if rank == 0:
+            if rank == 0 and config.eval_log_every_n_batches > 0 and (
+                processed_batches == 1 or processed_batches % config.eval_log_every_n_batches == 0
+            ):
                 print(f"  Completed inference in {inference_steps} steps")
 
             for collection in (batch, preds):

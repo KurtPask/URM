@@ -463,6 +463,24 @@ def main():
         default="0,1,3,5,7,9",
         help="Comma-separated list of loop count offsets to test during extrapolation",
     )
+    parser.add_argument(
+        "--max-test-examples-per-set",
+        type=int,
+        default=None,
+        help="Optional cap on examples per test set for faster eval (e.g. 50000).",
+    )
+    parser.add_argument(
+        "--test-example-stride",
+        type=int,
+        default=1,
+        help="Evaluate every Nth test example (N>1 subsamples test set).",
+    )
+    parser.add_argument(
+        "--eval-log-every-n-batches",
+        type=int,
+        default=0,
+        help="Print per-batch progress every N batches (0 disables per-batch logging).",
+    )
 
     args = parser.parse_args()
 
@@ -489,6 +507,9 @@ def main():
     config_overrides = {
         "global_batch_size": args.batch_size,
         "evaluators": [evaluator_cfg],
+        "eval_max_examples_per_set": args.max_test_examples_per_set,
+        "eval_example_stride": args.test_example_stride,
+        "eval_log_every_n_batches": args.eval_log_every_n_batches,
     }
 
     evaluate_checkpoint(
