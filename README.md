@@ -76,21 +76,21 @@ bash scripts/URM_sudoku.sh
 ```
 
 
-## Evaluating a Pretrained Sudoku Checkpoint
+## Evaluating Sudoku Checkpoints (Unified Script)
 ```bash
-# Direct Python entrypoint
-python evaluate_pretrained_sudoku.py \
-  --checkpoint-path checkpoints/URM-sudoku/step_83325.pt \
-  --data-path data/sudoku-extreme-1k-aug-1000 \
-  --output-dir eval_results/sudoku
+# Evaluate the latest checkpoint in each run directory under checkpoints/
+bash scripts/evaluate_sudoku_checkpoints.sh
 
-# Or helper shell wrapper
-bash scripts/evaluate_sudoku_pretrained.sh checkpoints/URM-sudoku/step_83325.pt
+# Evaluate a single checkpoint
+bash scripts/evaluate_sudoku_checkpoints.sh   --checkpoint-path checkpoints/URM-sudoku/step_83325.pt
 ```
 
-Notes:
-- The Sudoku evaluator expects the dataset layout produced by `data/build_sudoku_dataset.py` (`train/`, `test/`, and `identifiers.json`).
-- Evaluation always calls `model.eval()`, so dropout is disabled automatically during inference.
+What it does:
+- Evaluates against `data/sudoku-extreme-1k-aug-1000` by default.
+- In multi-run mode, scans `checkpoints/<run-name>/step_*.pt` and picks the largest step number per run.
+- Streams each completed model result into a timestamped CSV in `eval_results/sudoku/`.
+- Continues even if old checkpoints fail to load, logging the error in CSV.
+- Records both cell-level and exact puzzle accuracy, plus start/end timestamps per model.
 
 ### Citation
 ```
