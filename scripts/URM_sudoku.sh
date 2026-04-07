@@ -1,13 +1,15 @@
-run_name="URM-sudoku"
+run_name="URM-sudoku_bs100_gradaccum6"
 checkpoint_path="checkpoints/${run_name}" 
 mkdir -p $checkpoint_path
 
-torchrun --nproc-per-node $SLURM_GPUS_ON_NODE pretrain.py \
+export MASTER_PORT=$((20000 + (${SLURM_JOB_ID:-$$} % 20000)))
+torchrun --nproc-per-node $SLURM_GPUS_ON_NODE --master_port=${MASTER_PORT} pretrain.py \
     data_path=$HOME/TropicalURM/URM/data/sudoku-extreme-1k-aug-1000 \
     arch=urm arch.loops=16 arch.H_cycles=2 arch.L_cycles=6 arch.num_layers=4 \
-    epochs=50000 \
+    epochs=200000 \
     eval_interval=2000 \
-    lr=1e-4 puzzle_emb_lr=1e-4 weight_decay=1.0 puzzle_emb_weight_decay=1.0 global_batch_size=100 \
+    project_name=arcagi \
+    lr=1e-4 puzzle_emb_lr=1e-4 weight_decay=1.0 puzzle_emb_weight_decay=1.0 global_batch_size=100 grad_accum_steps=6 \
     +run_name=$run_name \
     +checkpoint_path=$checkpoint_path \
     +ema=True
