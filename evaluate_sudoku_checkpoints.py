@@ -13,7 +13,10 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -82,6 +85,8 @@ def evaluate_one_checkpoint(
     data_path: Path,
     output_dir: Path,
     batch_size: int,
+    max_test_examples_per_set: Optional[int],
+    test_example_stride: int,
 ) -> Dict[str, Any]:
     run_name = checkpoint_path.parent.name
     step = parse_step_from_name(checkpoint_path)
@@ -108,22 +113,62 @@ def evaluate_one_checkpoint(
         **run_metadata,
     }
 
-    try:
-        from evaluate_trained_model import evaluate_checkpoint
+    def _run_eval(batch: int) -> subprocess.CompletedProcess[str]:
+        cmd = [
+            sys.executable,
+            "evaluate_trained_model.py",
+            "--checkpoint-path",
+            str(checkpoint_path),
+            "--data-path",
+            str(data_path),
+            "--output-dir",
+            str(run_output_dir),
+            "--batch-size",
+            str(batch),
+            "--evaluator",
+            "sudoku@Sudoku",
+            "--eval-log-every-n-batches",
+            "0",
+        ]
+        if max_test_examples_per_set is not None:
+            cmd.extend(["--max-test-examples-per-set", str(max_test_examples_per_set)])
+        if test_example_stride > 1:
+            cmd.extend(["--test-example-stride", str(test_example_stride)])
 
-        evaluate_checkpoint(
-            checkpoint_path=str(checkpoint_path),
-            data_path=str(data_path),
-            output_dir=str(run_output_dir),
-            config_overrides={
-                "global_batch_size": batch_size,
-                "evaluators": [{"name": "sudoku@Sudoku"}],
-            },
-            wandb_project=None,
-            wandb_run_name=None,
-            save_predictions=False,
-            loop_offsets=None,
-        )
+        env = os.environ.copy()
+        env.setdefault("DISABLE_COMPILE", "1")
+        return subprocess.run(cmd, check=False, text=True, capture_output=True, env=env)
+
+    try:
+        attempts = [batch_size]
+        if batch_size > 128:
+            attempts.extend([max(128, batch_size // 2), max(64, batch_size // 4)])
+
+        last_result: Optional[subprocess.CompletedProcess[str]] = None
+        used_batch = batch_size
+        for candidate_batch in attempts:
+            result = _run_eval(candidate_batch)
+            last_result = result
+            used_batch = candidate_batch
+            if result.returncode == 0:
+                break
+
+            combined_output = (result.stdout + "\n" + result.stderr).lower()
+            is_resource_error = any(
+                token in combined_output
+                for token in ("out of memory", "cuda error", "cublas", "cudnn", "nccl")
+            )
+            if not is_resource_error:
+                break
+
+        if last_result is None or last_result.returncode != 0:
+            error_excerpt = ""
+            if last_result is not None:
+                merged = (last_result.stdout + "\n" + last_result.stderr).strip()
+                error_excerpt = merged[-3000:]
+            raise RuntimeError(
+                f"evaluation subprocess failed (batch_size={used_batch}):\n{error_excerpt}"
+            )
 
         metrics_file = run_output_dir / "metrics.json"
         if not metrics_file.exists():
@@ -199,7 +244,28 @@ def main() -> None:
     )
     parser.add_argument("--csv-path", type=Path, default=None, help="Optional explicit CSV path")
     parser.add_argument("--batch-size", type=int, default=512, help="Global evaluation batch size")
+    parser.add_argument(
+        "--max-test-examples-per-set",
+        type=int,
+        default=None,
+        help="Optional cap on examples per test set for faster checkpoint sweeps.",
+    )
+    parser.add_argument(
+        "--test-example-stride",
+        type=int,
+        default=1,
+        help="Use every Nth test example (N>1 for fast subsampled evaluation).",
+    )
     args = parser.parse_args()
+
+    if not args.data_path.exists():
+        raise FileNotFoundError(f"Dataset path does not exist: {args.data_path}")
+    if not (args.data_path / "test" / "dataset.json").exists():
+        raise FileNotFoundError(f"Missing required file: {args.data_path / 'test' / 'dataset.json'}")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive.")
+    if args.test_example_stride <= 0:
+        raise ValueError("--test-example-stride must be >= 1.")
 
     if args.checkpoint_path is not None:
         checkpoints = [args.checkpoint_path]
@@ -234,12 +300,38 @@ def main() -> None:
     print(f"Live CSV: {csv_path}")
 
     for index, checkpoint_path in enumerate(checkpoints, start=1):
+        if not checkpoint_path.exists():
+            row = {
+                "run_name": checkpoint_path.parent.name,
+                "train_run_name": "unknown",
+                "arch": "unknown",
+                "checkpoint_file": checkpoint_path.name,
+                "checkpoint_path": str(checkpoint_path),
+                "checkpoint_step": parse_step_from_name(checkpoint_path),
+                "config_path": str(checkpoint_path.parent / "config.yaml"),
+                "data_path": str(args.data_path),
+                "status": "failed",
+                "cell_accuracy": None,
+                "exact_accuracy": None,
+                "valid_solution_rate": None,
+                "started_at_utc": utc_now_iso(),
+                "completed_at_utc": utc_now_iso(),
+                "duration_seconds": 0.0,
+                "error": "checkpoint file not found",
+            }
+            rows.append(row)
+            append_csv_row(csv_path, fieldnames, row)
+            print(f"\n[{index}/{len(checkpoints)}] Skipping missing checkpoint: {checkpoint_path}")
+            continue
+
         print(f"\n[{index}/{len(checkpoints)}] Evaluating {checkpoint_path}")
         row = evaluate_one_checkpoint(
             checkpoint_path=checkpoint_path,
             data_path=args.data_path,
             output_dir=args.output_dir,
             batch_size=args.batch_size,
+            max_test_examples_per_set=args.max_test_examples_per_set,
+            test_example_stride=args.test_example_stride,
         )
         rows.append(row)
         append_csv_row(csv_path, fieldnames, row)
