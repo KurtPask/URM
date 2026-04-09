@@ -17,3 +17,4 @@ gpu_check.sh
 /*.sh
 *.json
 analysis/*
+eval_results/*

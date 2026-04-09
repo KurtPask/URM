@@ -214,8 +214,15 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
         ),
         split=split,
     )
+    num_workers = int(os.environ.get("EVAL_NUM_WORKERS", "1"))
+
     dataloader = DataLoader(
-        dataset, batch_size=None, num_workers=1, prefetch_factor=8, pin_memory=True, persistent_workers=True #og 1
+        dataset,
+        batch_size=None,
+        num_workers=num_workers,
+        prefetch_factor=8,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
     )
     return dataloader, dataset.metadata
 

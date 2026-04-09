@@ -40,6 +40,12 @@ def discover_latest_checkpoints(checkpoints_root: Path) -> List[Path]:
 
     discovered: List[Path] = []
     for run_dir in sorted(p for p in checkpoints_root.iterdir() if p.is_dir()):
+        run_name_l = run_dir.name.lower()
+
+        # Skip legacy TARM runs; only keep TARM V2 runs.
+        if "tarm" in run_name_l and "v2" not in run_name_l:
+            continue
+        
         candidates = [p for p in run_dir.glob("step_*.pt") if parse_step_from_name(p) is not None]
         if not candidates:
             continue
@@ -128,7 +134,7 @@ def evaluate_one_checkpoint(
             "--evaluator",
             "sudoku@Sudoku",
             "--eval-log-every-n-batches",
-            "0",
+            "1",
         ]
         if max_test_examples_per_set is not None:
             cmd.extend(["--max-test-examples-per-set", str(max_test_examples_per_set)])

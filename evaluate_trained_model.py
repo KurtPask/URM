@@ -91,26 +91,36 @@ def load_config_from_checkpoint(checkpoint_path: Path) -> PretrainConfig:
 
 def normalize_state_dict_for_model(model, state_dict):
     """
-    Normalize common wrapper prefixes so checkpoint keys match the current model.
-    Handles DDP/DataParallel 'module.' prefix.
+    Normalize common wrapper prefixes and a small set of legacy key renames
+    so checkpoint keys match the current model.
     """
-    model_keys = list(model.state_dict().keys())
-    ckpt_keys = list(state_dict.keys())
+    from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 
-    if not model_keys or not ckpt_keys:
-        return state_dict
+    state_dict = dict(state_dict)  # avoid mutating original in weird ways
 
-    model_has_module = model_keys[0].startswith("module.")
-    ckpt_has_module = ckpt_keys[0].startswith("module.")
+    # Handle wrapper prefixes from DDP / torch.compile
+    for prefix in ("module.", "_orig_mod."):
+        consume_prefix_in_state_dict_if_present(state_dict, prefix)
 
-    # Official DDP fix: strip 'module.' when loading DDP checkpoint into non-DDP model
-    if ckpt_has_module and not model_has_module:
-        consume_prefix_in_state_dict_if_present(state_dict, "module.")
-        return state_dict
+    # Legacy name remaps
+    remapped = {}
+    for k, v in state_dict.items():
+        nk = k
 
-    # Reverse case: add 'module.' if model is wrapped but checkpoint is not
-    if model_has_module and not ckpt_has_module:
-        return {f"module.{k}": v for k, v in state_dict.items()}
+        # older checkpoints used self_attn.out.weight
+        nk = nk.replace(".self_attn.out.", ".self_attn.o_proj.")
+
+        remapped[nk] = v
+
+    state_dict = remapped
+
+    model_keys = set(model.state_dict().keys())
+    ckpt_keys = set(state_dict.keys())
+
+    # If model is wrapped but checkpoint is not
+    if model_keys and next(iter(model_keys)).startswith("module."):
+        if ckpt_keys and not next(iter(ckpt_keys)).startswith("module."):
+            state_dict = {f"module.{k}": v for k, v in state_dict.items()}
 
     return state_dict
 
