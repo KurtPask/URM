@@ -8,10 +8,17 @@ from torch.nn.functional import scaled_dot_product_attention
 import einops
 import math
 
+_flash_attn_import_error: Optional[Exception] = None
+flash_attn_func = None
 try:
-    from flash_attn_interface import flash_attn_func
+    from flash_attn_interface import flash_attn_func  # type: ignore[assignment]
 except ImportError:
-    from flash_attn import flash_attn_func
+    try:
+        from flash_attn import flash_attn_func  # type: ignore[assignment]
+    except ImportError as exc:
+        _flash_attn_import_error = exc
+
+_FLASH_ATTN_ENABLED = flash_attn_func is not None
 
 from models.common import trunc_normal_init_
 
@@ -126,10 +133,38 @@ class Attention(nn.Module):
             cos, sin = cos_sin
             query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
-        # flash attn
-        attn_output = flash_attn_func(q=query, k=key, v=value, causal=self.causal)
-        if isinstance(attn_output, tuple):  # fa2 and fa3 compatibility
-            attn_output = attn_output[0]
+        # Attention kernel (FlashAttention when available, otherwise PyTorch SDPA fallback).
+        global _FLASH_ATTN_ENABLED
+        attn_output = None
+        if _FLASH_ATTN_ENABLED and hidden_states.is_cuda and flash_attn_func is not None:
+            try:
+                attn_output = flash_attn_func(q=query, k=key, v=value, causal=self.causal)
+                if isinstance(attn_output, tuple):  # fa2 and fa3 compatibility
+                    attn_output = attn_output[0]
+            except RuntimeError as exc:
+                message = str(exc).lower()
+                if "flashattention only supports ampere gpus or newer" in message:
+                    _FLASH_ATTN_ENABLED = False
+                else:
+                    raise
+
+        if attn_output is None:
+            # Fallback for older GPUs / environments without FlashAttention.
+            query_t = query.transpose(1, 2)
+            key_t = key.transpose(1, 2)
+            value_t = value.transpose(1, 2)
+            if query_t.shape[1] != key_t.shape[1]:
+                repeat_factor = query_t.shape[1] // key_t.shape[1]
+                key_t = key_t.repeat_interleave(repeat_factor, dim=1)
+                value_t = value_t.repeat_interleave(repeat_factor, dim=1)
+            attn_output = scaled_dot_product_attention(
+                query_t,
+                key_t,
+                value_t,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=self.causal,
+            ).transpose(1, 2)
 
         # attn_output: [batch_size, num_heads, seq_len, head_dim]
         attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
