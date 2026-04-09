@@ -47,9 +47,10 @@ class Sudoku:
     def update_batch(self, batch: Dict[str, torch.Tensor], preds: Dict[str, torch.Tensor]):
         labels = batch["labels"].cpu()
         pred_tokens = preds["preds"].cpu()
-        puzzle_identifiers = batch["puzzle_identifiers"].cpu()
-
-        valid_examples = puzzle_identifiers != self.blank_identifier_id
+        # Some datasets (including Sudoku) use the same puzzle identifier value for
+        # both real examples and padding placeholders. Use labels to identify
+        # padded examples robustly instead.
+        valid_examples = (labels >= 0).any(dim=-1)
         if not torch.any(valid_examples):
             return
 
