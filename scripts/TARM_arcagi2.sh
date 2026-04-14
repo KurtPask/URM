@@ -1,12 +1,12 @@
 optimizer_name="schedulefree"  # "schedulefree" or "adam_atan2"
-run_name="TARM-arcagi1_v2_loop16_H1_L32_layers1_gradaccum6_hidden512_head8_skedfree_novalmap"
+run_name="TARM-arcagi2_v2_loop16_H1_L32_layers1_gradaccum6_hidden512_head8_skedfree_novalmap"
 checkpoint_path="checkpoints/${run_name}"
 mkdir -p "$checkpoint_path"
 
 export MASTER_PORT=$((20000 + (${SLURM_JOB_ID:-$$} % 20000)))
 
 torchrun --nproc-per-node ${SLURM_GPUS_ON_NODE:-1} --master_port=${MASTER_PORT} pretrain.py \
-    data_path=data/arc1concept-aug-1000 \
+    data_path=data/arc2concept-aug-1000 \
     arch=tarm arch.loops=16 arch.H_cycles=1 arch.L_cycles=32 arch.hidden_size=512 arch.num_heads=8 arch.num_layers=1 \
     epochs=50000 \
     eval_interval=2000 \
