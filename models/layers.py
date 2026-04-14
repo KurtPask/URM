@@ -167,12 +167,12 @@ class Attention(nn.Module):
             ).transpose(1, 2)
 
         # attn_output: [batch_size, num_heads, seq_len, head_dim]
-        attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
+        attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)  # type: ignore
         return self.o_proj(attn_output)
 
 
 class TropicalAttentionV2(nn.Module):
-    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False, attn_dropout=0.0, **kwargs):
+    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False, attn_dropout=0.0, valuation_map: bool = False, **kwargs):
         super().__init__()
 
         self.hidden_size = hidden_size
@@ -181,6 +181,7 @@ class TropicalAttentionV2(nn.Module):
         self.num_heads = num_heads
         self.num_key_value_heads = num_key_value_heads
         self.causal = causal
+        self.valuation_map = valuation_map
 
         self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
         self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
@@ -208,21 +209,27 @@ class TropicalAttentionV2(nn.Module):
         #     attn_output = attn_output[0]
 
         ######
-        q_t = torch.log1p(F.relu(query.to(torch.float32))) # [bs, seq_len, num_heads, head_dim]
-        k_t = torch.log1p(F.relu(key.to(torch.float32)))# [bs, seq_len, num_heads, head_dim]
-        v_t = torch.log1p(F.relu(value.to(torch.float32))) # [bs, seq_len, num_heads, head_dim]
+        if self.valuation_map:
+            q_t = torch.log1p(F.relu(query.to(torch.float32))) # [bs, seq_len, num_heads, head_dim]
+            k_t = torch.log1p(F.relu(key.to(torch.float32)))# [bs, seq_len, num_heads, head_dim]
+            v_t = torch.log1p(F.relu(value.to(torch.float32))) # [bs, seq_len, num_heads, head_dim]
 
-        diff = q_t.unsqueeze(2) - k_t.unsqueeze(1) # [bs, q_seq_len, k_seq_len, num_heads, head_dim]
+            diff = q_t.unsqueeze(2) - k_t.unsqueeze(1) # [bs, q_seq_len, k_seq_len, num_heads, head_dim]
+        else:
+            diff = query.unsqueeze(2) - key.unsqueeze(1) # [bs, q_seq_len, k_seq_len, num_heads, head_dim]
         max_diff = diff.amax(dim=-1) # [bs, q_seq_len, k_seq_len, num_heads]
         min_diff = diff.amin(dim=-1) # [bs, q_seq_len, k_seq_len, num_heads]
         attn_scores = -(max_diff - min_diff) # [bs, q_seq_len, k_seq_len, num_heads]
-        sum_sv = attn_scores.unsqueeze(-1) + v_t.unsqueeze(1) # [bs, q_seq_len, k_seq_len, num_heads, head_dim]
+        sum_sv = attn_scores.unsqueeze(-1) + v_t.unsqueeze(1) if self.valuation_map else attn_scores.unsqueeze(-1) + value.unsqueeze(1) # [bs, q_seq_len, k_seq_len, num_heads, head_dim]
         context = sum_sv.max(dim=2).values # [bs, q_seq_len, num_heads, head_dim]
-        attn_output = torch.expm1(context).to(hidden_states.dtype) # [bs, q_seq_len, num_heads, head_dim]
+        if self.valuation_map:  
+            attn_output = torch.expm1(context).to(hidden_states.dtype) # [bs, q_seq_len, num_heads, head_dim]
+        else:
+            attn_output = context.to(hidden_states.dtype) # [bs, q_seq_len, num_heads, head_dim]
         ######
 
         # attn_output: [batch_size, num_heads, seq_len, head_dim]
-        attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # [bs, seq_len, num_heads * head_dim]
+        attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)  # [bs, seq_len, num_heads * head_dim]
         return self.o_proj(attn_output) # [bs, seq_len, hidden_size]
 
 class TropicalLinear(nn.Module):

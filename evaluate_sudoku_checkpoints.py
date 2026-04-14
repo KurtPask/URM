@@ -43,7 +43,7 @@ def discover_latest_checkpoints(checkpoints_root: Path) -> List[Path]:
         run_name_l = run_dir.name.lower()
 
         # Skip legacy TARM runs; only keep TARM V2 runs.
-        if "tarm" in run_name_l and "v2" not in run_name_l:
+        if "hidden" in run_name_l: #run_name_l != "urm-sudoku_h1_l32_layers1_bs100_gradaccum6":          #"tarm" in run_name_l:# and "v2" not in run_name_l: ### NOT DOING TARM FOR THIS RUN AT ALL
             continue
         
         candidates = [p for p in run_dir.glob("step_*.pt") if parse_step_from_name(p) is not None]
