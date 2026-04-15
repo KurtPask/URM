@@ -1,0 +1,62 @@
+name: pdat_tarm.pdat_tarm@PDATTARM
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+
+loops: 6
+H_cycles: 1
+L_cycles: 2
+
+num_layers: 4
+hidden_size: 512
+num_heads: 8
+expansion: 4
+
+puzzle_emb_ndim: ${.hidden_size}
+pos_encodings: rope
+task_type: auto
+
+num_factors: 32
+factor_seed_topk: 16
+entity_factor_topk: 8
+factor_entity_topk: 16
+
+entity_keep_ratio: 1.0
+factor_keep_ratio: 1.0
+
+support_tau_start: 1.0
+support_tau_end: 0.1
+conflict_tau_start: 1.0
+conflict_tau_end: 0.1
+tau_anneal_steps: 20000
+tau_schedule: cosine
+
+valuation_map: true
+structural_factor_init: weak
+structural_prior_strength: 0.25
+
+attn_scale: 0.90
+support_scale: 0.50
+conflict_scale: 0.50
+mlp_scale: 0.70
+input_inject_scale: 0.25
+
+alpha_max: 0.60
+entity_alpha_init: 0.35
+factor_alpha_init: 0.35
+field_alpha_init: 0.50
+factor_refresh_alpha: 0.50
+
+entity_freeze_delta_threshold: 0.003
+entity_freeze_confidence_threshold: 0.985
+factor_freeze_delta_threshold: 0.003
+min_loops_before_entity_freeze: 1
+min_loops_before_factor_freeze: 2
+freeze_prefix_tokens: true
+
+halt_delta_threshold: 0.010
+halt_unresolved_threshold: 0.30
+min_loops_before_halt: 2
+certificate_weight: 0.10
+
+forward_dtype: bfloat16
