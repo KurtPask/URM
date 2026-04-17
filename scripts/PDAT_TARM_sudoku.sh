@@ -7,7 +7,7 @@ export MASTER_PORT="${MASTER_PORT:-$((20000 + (${SLURM_JOB_ID:-$$} % 20000)))}"
 
 data_path="${DATA_PATH:-$HOME/TropicalURM/URM/data/sudoku-extreme-1k-aug-1000}"
 project_name="${PROJECT_NAME:-arcagi}"
-run_name="${RUN_NAME:-PDAT-TARM-sudoku-full-v1}"
+run_name="${RUN_NAME:-PDAT-TARM-sudoku-compact-v1}"
 checkpoint_path="${CHECKPOINT_PATH:-checkpoints/${run_name}}"
 
 mkdir -p "$checkpoint_path"
@@ -18,10 +18,14 @@ torchrun --nproc-per-node "${gpu_count}" --master_port="${MASTER_PORT}" pretrain
     arch.task_type=sudoku \
     arch.loops=8 \
     arch.H_cycles=1 \
-    arch.L_cycles=3 \
-    arch.hidden_size=512 \
+    arch.L_cycles=2 \
+    arch.hidden_size= 256 \
     arch.num_heads=8 \
-    arch.num_layers=4 \
+    arch.num_layers=2 \
+    arch.num_factors=32 \
+    arch.factor_seed_topk=12 \
+    arch.entity_factor_topk=6 \
+    arch.factor_entity_topk=12 \
     arch.factor_keep_ratio=1.0 \
     arch.entity_keep_ratio=1.0 \
     arch.support_tau_start=1.0 \
