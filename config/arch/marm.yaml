@@ -1,0 +1,25 @@
+name: marm.marm@MARM
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+
+loops: 16
+H_cycles: 2
+L_cycles: 6
+
+num_layers: 4
+hidden_size: 512
+num_heads: 8
+num_key_value_heads: 8
+expansion: 4
+
+puzzle_emb_ndim: ${.hidden_size}
+pos_encodings: rope
+
+attn_dropout: 0.0
+flash_fraction: 0.5
+valuation_map: true
+
+rms_norm_eps: 1e-5
+rope_theta: 10000.0
+forward_dtype: bfloat16

@@ -171,8 +171,218 @@ class Attention(nn.Module):
         return self.o_proj(attn_output)
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# assumes these already exist in your codebase:
+# - CastedLinear
+# - apply_rotary_pos_emb
+# - flash_attn_func
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    x: [bs, seq, kv_heads, head_dim]
+    returns: [bs, seq, kv_heads * n_rep, head_dim]
+    """
+    if n_rep == 1:
+        return x
+    bs, seq, kv_heads, head_dim = x.shape
+    x = x[:, :, :, None, :].expand(bs, seq, kv_heads, n_rep, head_dim)
+    return x.reshape(bs, seq, kv_heads * n_rep, head_dim)
+
+
+class MixedAttention(nn.Module):
+    """
+    Routes one subset of heads through flash attention and the rest through tropical attention.
+
+    Important:
+    - If using GQA/MQA, this splits by whole KV groups so head alignment stays valid.
+    - If num_key_value_heads == 1, both branches share the same K/V head.
+    """
+    def __init__(
+        self,
+        hidden_size,
+        head_dim,
+        num_heads,
+        num_key_value_heads,
+        causal=False,
+        attn_dropout=0.0,
+        valuation_map: bool = True,
+        flash_fraction: float = 0.5,
+        **kwargs,
+    ):
+        super().__init__()
+
+        if not (0.0 < flash_fraction < 1.0):
+            raise ValueError("flash_fraction must be between 0 and 1.")
+
+        if num_heads % num_key_value_heads != 0:
+            raise ValueError(
+                f"num_heads ({num_heads}) must be divisible by "
+                f"num_key_value_heads ({num_key_value_heads}) for GQA-style routing."
+            )
+
+        self.hidden_size = hidden_size
+        self.head_dim = head_dim
+        self.num_heads = num_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.output_size = num_heads * head_dim
+        self.causal = causal
+        self.attn_dropout = attn_dropout
+        self.valuation_map = valuation_map
+
+        self.q_per_kv = num_heads // num_key_value_heads
+
+        # Shared projections
+        self.qkv_proj = CastedLinear(
+            hidden_size,
+            (num_heads + 2 * num_key_value_heads) * head_dim,
+            bias=False,
+        )
+        self.o_proj = CastedLinear(self.output_size, hidden_size, bias=False)
+
+        # Split heads in a GQA-safe way.
+        # If kv_heads > 1, split by kv groups.
+        if num_key_value_heads > 1:
+            flash_kv_heads = int(round(num_key_value_heads * flash_fraction))
+            flash_kv_heads = max(1, min(flash_kv_heads, num_key_value_heads - 1))
+
+            self.flash_kv_heads = flash_kv_heads
+            self.tropical_kv_heads = num_key_value_heads - flash_kv_heads
+
+            self.flash_heads = self.flash_kv_heads * self.q_per_kv
+            self.tropical_heads = num_heads - self.flash_heads
+            self.shared_kv = False
+        else:
+            # MQA case: only one KV head, so both branches share it.
+            flash_heads = int(round(num_heads * flash_fraction))
+            flash_heads = max(1, min(flash_heads, num_heads - 1))
+
+            self.flash_heads = flash_heads
+            self.tropical_heads = num_heads - flash_heads
+
+            self.flash_kv_heads = 1
+            self.tropical_kv_heads = 1
+            self.shared_kv = True
+
+    def _tropical_attention(
+        self,
+        query: torch.Tensor,   # [bs, q_len, q_heads, head_dim]
+        key: torch.Tensor,     # [bs, k_len, q_heads, head_dim]  (already repeated/aligned)
+        value: torch.Tensor,   # [bs, k_len, q_heads, head_dim]  (already repeated/aligned)
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if self.valuation_map:
+            q_t = torch.log1p(F.relu(query.to(torch.float32)))
+            k_t = torch.log1p(F.relu(key.to(torch.float32)))
+            v_t = torch.log1p(F.relu(value.to(torch.float32)))
+            diff = q_t.unsqueeze(2) - k_t.unsqueeze(1)   # [bs, q_len, k_len, heads, dim]
+        else:
+            v_t = value.to(torch.float32)
+            diff = query.to(torch.float32).unsqueeze(2) - key.to(torch.float32).unsqueeze(1)
+
+        max_diff = diff.amax(dim=-1)                    # [bs, q_len, k_len, heads]
+        min_diff = diff.amin(dim=-1)                    # [bs, q_len, k_len, heads]
+        attn_scores = -(max_diff - min_diff)            # [bs, q_len, k_len, heads]
+
+        if self.causal:
+            q_len = attn_scores.size(1)
+            k_len = attn_scores.size(2)
+            causal_mask = torch.ones(
+                q_len, k_len, device=attn_scores.device, dtype=torch.bool
+            ).triu(1)
+            attn_scores = attn_scores.masked_fill(
+                causal_mask.unsqueeze(0).unsqueeze(-1),
+                torch.finfo(attn_scores.dtype).min,
+            )
+
+        sum_sv = attn_scores.unsqueeze(-1) + v_t.unsqueeze(1)   # [bs, q_len, k_len, heads, dim]
+        context = sum_sv.max(dim=2).values                      # [bs, q_len, heads, dim]
+
+        if self.valuation_map:
+            return torch.expm1(context).to(out_dtype)
+        return context.to(out_dtype)
+
+    def forward(self, cos_sin, hidden_states: torch.Tensor) -> torch.Tensor:
+        bs, seq_len, _ = hidden_states.shape
+
+        qkv = self.qkv_proj(hidden_states)
+        qkv = qkv.view(
+            bs,
+            seq_len,
+            self.num_heads + 2 * self.num_key_value_heads,
+            self.head_dim,
+        )
+
+        query = qkv[:, :, :self.num_heads]
+        key = qkv[:, :, self.num_heads : self.num_heads + self.num_key_value_heads]
+        value = qkv[:, :, self.num_heads + self.num_key_value_heads :]
+
+        if cos_sin is not None:
+            cos, sin = cos_sin
+            query, key = apply_rotary_pos_emb(query, key, cos, sin)
+
+        # -------------------------
+        # Split into flash / tropical branches
+        # -------------------------
+        if self.shared_kv:
+            # MQA: one KV head shared by both branches
+            flash_q = query[:, :, :self.flash_heads]
+            tropical_q = query[:, :, self.flash_heads:]
+
+            flash_k = key
+            flash_v = value
+
+            tropical_k = key.expand(-1, -1, self.tropical_heads, -1)
+            tropical_v = value.expand(-1, -1, self.tropical_heads, -1)
+
+        else:
+            # GQA-safe split by whole KV groups
+            flash_q = query[:, :, :self.flash_heads]
+            tropical_q = query[:, :, self.flash_heads:]
+
+            flash_k = key[:, :, :self.flash_kv_heads]
+            flash_v = value[:, :, :self.flash_kv_heads]
+
+            tropical_k = key[:, :, self.flash_kv_heads:]
+            tropical_v = value[:, :, self.flash_kv_heads:]
+
+            # Tropical branch wants head-aligned K/V
+            tropical_k = repeat_kv(tropical_k, self.q_per_kv)
+            tropical_v = repeat_kv(tropical_v, self.q_per_kv)
+
+        # -------------------------
+        # Flash branch
+        # -------------------------
+        flash_out = flash_attn_func(
+            q=flash_q,
+            k=flash_k,
+            v=flash_v,
+            causal=self.causal,
+        )
+        if isinstance(flash_out, tuple):  # FA2 / FA3 compatibility
+            flash_out = flash_out[0]
+
+        # -------------------------
+        # Tropical branch
+        # -------------------------
+        tropical_out = self._tropical_attention(
+            tropical_q,
+            tropical_k,
+            tropical_v,
+            out_dtype=hidden_states.dtype,
+        )
+
+        # Concatenate heads back together
+        attn_output = torch.cat([flash_out, tropical_out], dim=2)   # [bs, seq, num_heads, head_dim]
+        attn_output = attn_output.reshape(bs, seq_len, self.output_size)
+
+        return self.o_proj(attn_output)
+
+
 class TropicalAttentionV2(nn.Module):
-    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False, attn_dropout=0.0, valuation_map: bool = False, **kwargs):
+    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False, attn_dropout=0.0, valuation_map: bool = True, **kwargs):
         super().__init__()
 
         self.hidden_size = hidden_size
@@ -231,7 +441,7 @@ class TropicalAttentionV2(nn.Module):
         # attn_output: [batch_size, num_heads, seq_len, head_dim]
         attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)  # [bs, seq_len, num_heads * head_dim]
         return self.o_proj(attn_output) # [bs, seq_len, hidden_size]
-
+ 
 class TropicalLinear(nn.Module):
     def __init__(
         self,

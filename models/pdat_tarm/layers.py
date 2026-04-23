@@ -251,13 +251,7 @@ class SparseEntityFactorRouter(nn.Module):
 
 
 class AsynchronousScheduler(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        entity_keep_ratio: float,
-        factor_keep_ratio: float,
-        norm_eps: float,
-    ) -> None:
+    def __init__(self, hidden_size: int, entity_keep_ratio: float, factor_keep_ratio: float, norm_eps: float) -> None:
         super().__init__()
         self.entity_keep_ratio = entity_keep_ratio
         self.factor_keep_ratio = factor_keep_ratio
@@ -265,6 +259,14 @@ class AsynchronousScheduler(nn.Module):
 
         self.entity_score = CastedLinear(hidden_size * 3, 1, bias=True)
         self.factor_score = CastedLinear(hidden_size * 3, 1, bias=True)
+
+        if self.entity_keep_ratio >= 1.0:
+            for p in self.entity_score.parameters():
+                p.requires_grad = False
+
+        if self.factor_keep_ratio >= 1.0:
+            for p in self.factor_score.parameters():
+                p.requires_grad = False
 
     @staticmethod
     def _topk_gate(scores: torch.Tensor, keep_ratio: float, valid_mask: torch.Tensor) -> torch.Tensor:

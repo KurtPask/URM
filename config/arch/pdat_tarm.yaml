@@ -21,8 +21,8 @@ factor_seed_topk: 16
 entity_factor_topk: 8
 factor_entity_topk: 16
 
-entity_keep_ratio: 1.0
-factor_keep_ratio: 1.0
+entity_keep_ratio: 0.999
+factor_keep_ratio: 0.999
 
 support_tau_start: 1.0
 support_tau_end: 0.1

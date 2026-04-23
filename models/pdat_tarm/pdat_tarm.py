@@ -375,21 +375,24 @@ class PDATTARMInner(nn.Module):
         if not valid_mask.any():
             return support_logits.new_zeros(())
 
+        masked_labels = torch.where(valid_mask, labels, 0).to(torch.long)
+
         support_loss = F.cross_entropy(
             support_logits[valid_mask].to(torch.float32),
-            labels[valid_mask].to(torch.long),
+            masked_labels[valid_mask],
         )
 
-        masked_labels = torch.where(valid_mask, labels, 0)
         correct_conflict = torch.gather(
             conflict_logits.to(torch.float32),
             dim=-1,
             index=masked_labels.unsqueeze(-1),
         ).squeeze(-1)
+
         incorrect_conflict = conflict_logits.to(torch.float32).masked_fill(
             F.one_hot(masked_labels, num_classes=conflict_logits.shape[-1]).bool(),
             float("-inf"),
         ).amax(dim=-1)
+
         violation_loss = F.softplus(1.0 + correct_conflict - incorrect_conflict)
         violation_loss = violation_loss[valid_mask].mean()
         return self.config.certificate_weight * (support_loss + violation_loss)
