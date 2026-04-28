@@ -13,7 +13,7 @@ from models.layers import (
     CosSin,
     CastedEmbedding,
     CastedLinear,
-    TropicalAttentionV2 as TropicalAttention,  # Original: TropicalAttention(
+    TropicalAttention as TropicalAttention,  # Original: TropicalAttentionV2 as TropicalAttention,
 )
 from models.sparse_embedding import CastedSparseEmbedding
 
