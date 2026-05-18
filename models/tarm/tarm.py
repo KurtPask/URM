@@ -13,7 +13,8 @@ from models.layers import (
     CosSin,
     CastedEmbedding,
     CastedLinear,
-    TropicalAttention as TropicalAttention,  # Original: TropicalAttentionV2 as TropicalAttention,
+    TropicalAttention,
+    TropicalAttentionV3,
 )
 from models.sparse_embedding import CastedSparseEmbedding
 
@@ -40,6 +41,7 @@ class TARMConfig(BaseModel):
     tropical_proj: bool = True
     tropical_qkv_proj: bool = False
     tropical_norm: str = "none"
+    tropical_attention_version: str = "v1"
     attn_dropout: float = 0.0
     q_dropout: float = 0.0
     k_dropout: float = 0.0
@@ -56,7 +58,14 @@ class TARMConfig(BaseModel):
 class TARMBlock(nn.Module):
     def __init__(self, config: TARMConfig) -> None:
         super().__init__()
-        self.self_attn = TropicalAttention(  # Original: TropicalAttention(
+        if config.tropical_attention_version == "v1":
+            attention_cls = TropicalAttention
+        elif config.tropical_attention_version == "v3":
+            attention_cls = TropicalAttentionV3
+        else:
+            raise ValueError("tropical_attention_version must be one of: 'v1', 'v3'.")
+
+        self.self_attn = attention_cls(
             hidden_size=config.hidden_size,
             head_dim=config.hidden_size // config.num_heads,
             num_heads=config.num_heads,

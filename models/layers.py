@@ -22,8 +22,71 @@ _FLASH_ATTN_ENABLED = flash_attn_func is not None
 
 from models.common import trunc_normal_init_
 
+try:
+    from tropical_gemm.pytorch import (
+        tropical_maxplus_matmul,
+        tropical_maxplus_matmul_gpu,
+        tropical_maxplus_matmul_batched,
+        tropical_minplus_matmul_batched,
+        GPU_AVAILABLE,
+        _DLPACK_AVAILABLE,
+        _BATCHED_DLPACK_AVAILABLE,
+    )
+    _TROPICAL_GEMM_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:
+    tropical_maxplus_matmul = None
+    tropical_maxplus_matmul_gpu = None
+    tropical_maxplus_matmul_batched = None
+    tropical_minplus_matmul_batched = None
+    GPU_AVAILABLE = False
+    _DLPACK_AVAILABLE = False
+    _BATCHED_DLPACK_AVAILABLE = False
+    _TROPICAL_GEMM_IMPORT_ERROR = exc
+
 
 CosSin = Tuple[torch.Tensor, torch.Tensor]
+
+
+def _require_tropical_gemm() -> None:
+    if tropical_maxplus_matmul is None:
+        raise RuntimeError(
+            "tropical-gemm is required for this path. Install tropical-gemm[torch]."
+        ) from _TROPICAL_GEMM_IMPORT_ERROR
+
+
+def _tg_maxplus_mm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    _require_tropical_gemm()
+    a = a.contiguous().to(torch.float32)
+    b = b.contiguous().to(torch.float32)
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError("_tg_maxplus_mm expects 2D tensors.")
+    if a.is_cuda or b.is_cuda:
+        if not (GPU_AVAILABLE and _DLPACK_AVAILABLE):
+            raise RuntimeError("tropical-gemm CUDA path unavailable; missing GPU/DLPACK support.")
+        return tropical_maxplus_matmul_gpu(a, b)
+    return tropical_maxplus_matmul(a, b)
+
+
+def _tg_maxplus_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    _require_tropical_gemm()
+    a = a.contiguous().to(torch.float32)
+    b = b.contiguous().to(torch.float32)
+    if a.ndim != 3 or b.ndim != 3:
+        raise ValueError("_tg_maxplus_bmm expects 3D tensors.")
+    if (a.is_cuda or b.is_cuda) and not _BATCHED_DLPACK_AVAILABLE:
+        raise RuntimeError("tropical-gemm batched CUDA path unavailable; missing batched DLPACK support.")
+    return tropical_maxplus_matmul_batched(a, b)
+
+
+def _tg_minplus_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    _require_tropical_gemm()
+    a = a.contiguous().to(torch.float32)
+    b = b.contiguous().to(torch.float32)
+    if a.ndim != 3 or b.ndim != 3:
+        raise ValueError("_tg_minplus_bmm expects 3D tensors.")
+    if (a.is_cuda or b.is_cuda) and not _BATCHED_DLPACK_AVAILABLE:
+        raise RuntimeError("tropical-gemm batched CUDA path unavailable; missing batched DLPACK support.")
+    return tropical_minplus_matmul_batched(a, b)
 
 
 def _find_multiple(a, b):
@@ -466,11 +529,17 @@ class TropicalLinear(nn.Module):
         self.W = nn.Parameter(weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_expanded = x.unsqueeze(-2)
-        W_expanded = self.W.unsqueeze(0)
-        Wx = x_expanded + W_expanded
-        y, _ = torch.max(Wx, dim=-1)
-        return y
+        x_dtype = x.dtype
+        try:
+            x2 = x.reshape(-1, self.input_dim)
+            y2 = _tg_maxplus_mm(x2, self.W.T)
+            return y2.reshape(*x.shape[:-1], self.output_dim).to(x_dtype)
+        except Exception:
+            x_expanded = x.unsqueeze(-2)
+            W_expanded = self.W.unsqueeze(0)
+            Wx = x_expanded + W_expanded
+            y, _ = torch.max(Wx, dim=-1)
+            return y
 
 
 class DeepSet(nn.Module):
@@ -668,6 +737,66 @@ class TropicalAttention(nn.Module):
         context = torch.expm1(context)
         output = self.out(context)
 
+        return output, attn_scores
+
+    def forward(self, cos_sin: Optional[CosSin], hidden_states: torch.Tensor) -> torch.Tensor:
+        output, _ = self.forward_with_scores(hidden_states, cos_sin=cos_sin)
+        return output
+
+
+class TropicalAttentionV3(TropicalAttention):
+    def forward_with_scores(self, x: torch.Tensor, cos_sin: Optional[CosSin] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.q_dropout.p != 0.0 or self.k_dropout.p != 0.0 or self.v_dropout.p != 0.0:
+            raise ValueError("TropicalAttentionV3 currently requires q_dropout=k_dropout=v_dropout=0.0.")
+        if not self.symmetric:
+            raise ValueError("TropicalAttentionV3 currently supports only symmetric Hilbert tropical attention.")
+
+        batch_size, seq_len, _ = x.size()
+        x_pos = torch.log1p(F.relu(x))
+        if self.tropical_norm != "none":
+            x_pos = self.normalize_tropical(x_pos)
+
+        if self.tropical_qkv_proj:
+            q = self.query_proj(x_pos)
+            k = self.key_proj(x_pos)
+            v = self.value_proj(x_pos)
+        else:
+            q, k, v = x_pos, x_pos, x_pos
+
+        q = q.reshape(batch_size, seq_len, self.n_heads, self.d_k)
+        k = k.reshape(batch_size, seq_len, self.n_heads, self.d_k)
+        v = v.reshape(batch_size, seq_len, self.n_heads, self.d_k)
+
+        if cos_sin is not None:
+            cos, sin = cos_sin
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        q = q.permute(0, 2, 1, 3).reshape(batch_size * self.n_heads, seq_len, self.d_k)
+        k = k.permute(0, 2, 1, 3).reshape(batch_size * self.n_heads, seq_len, self.d_k)
+        v = v.permute(0, 2, 1, 3).reshape(batch_size * self.n_heads, seq_len, self.d_k)
+
+        if self.tropical_proj:
+            q = self.query_trop(q)
+            k = self.key_trop(k)
+            v = self.value_trop(v)
+
+        q = q.to(torch.float32).contiguous()
+        k = k.to(torch.float32).contiguous()
+        v = v.to(torch.float32).contiguous()
+
+        neg_k_t = (-k).transpose(1, 2).contiguous()
+        max_diff = _tg_maxplus_bmm(q, neg_k_t)
+        min_diff = _tg_minplus_bmm(q, neg_k_t)
+        attn_scores = -(max_diff - min_diff)
+
+        context = _tg_maxplus_bmm(attn_scores, v)
+        context = (
+            context.reshape(batch_size, self.n_heads, seq_len, self.d_k)
+            .permute(0, 2, 1, 3)
+            .reshape(batch_size, seq_len, -1)
+        )
+        context = torch.expm1(context)
+        output = self.out(context.to(x.dtype))
         return output, attn_scores
 
     def forward(self, cos_sin: Optional[CosSin], hidden_states: torch.Tensor) -> torch.Tensor:
