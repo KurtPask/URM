@@ -23,8 +23,12 @@ pos_encodings: rope
 # tropical_proj: false
 # tropical_qkv_proj: true
 # tropical_norm: none
+# tropical_attention_version: v1
+# v1 = original TropicalAttention
+# v3 = tropical-gemm-backed TropicalAttentionV3
 # q_dropout: 0.0
 # k_dropout: 0.0
 # v_dropout: 0.0
+tropical_attention_version: v1
 
 forward_dtype: bfloat16
