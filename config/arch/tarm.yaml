@@ -26,6 +26,7 @@ pos_encodings: rope
 # tropical_attention_version: v1
 # v1 = original TropicalAttention
 # v3 = tropical-gemm-backed TropicalAttentionV3
+# v4 = TropicalAttentionV2 flow with tropical-gemm-backed attention core
 # q_dropout: 0.0
 # k_dropout: 0.0
 # v_dropout: 0.0

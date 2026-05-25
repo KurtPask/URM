@@ -804,6 +804,62 @@ class TropicalAttentionV3(TropicalAttention):
         return output
 
 
+class TropicalAttentionV4(TropicalAttentionV2):
+    """
+    TropicalAttentionV2-style module that uses tropical-gemm batched kernels
+    for the tropical attention computation only.
+    """
+
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = hidden_states.shape
+
+        qkv = self.qkv_proj(hidden_states)
+        qkv = qkv.view(batch_size, seq_len, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
+        query = qkv[:, :, :self.num_heads]
+        key = qkv[:, :, self.num_heads: self.num_heads + self.num_key_value_heads]
+        value = qkv[:, :, self.num_heads + self.num_key_value_heads:]
+
+        if self.num_key_value_heads != self.num_heads:
+            if self.num_heads % self.num_key_value_heads != 0:
+                raise ValueError("num_heads must be divisible by num_key_value_heads for TropicalAttentionV4.")
+            rep = self.num_heads // self.num_key_value_heads
+            key = repeat_kv(key, rep)
+            value = repeat_kv(value, rep)
+
+        if cos_sin is not None:
+            cos, sin = cos_sin
+            query, key = apply_rotary_pos_emb(query, key, cos, sin)
+
+        if self.valuation_map:
+            q_t = torch.log1p(F.relu(query.to(torch.float32)))
+            k_t = torch.log1p(F.relu(key.to(torch.float32)))
+            v_t = torch.log1p(F.relu(value.to(torch.float32)))
+        else:
+            q_t = query.to(torch.float32)
+            k_t = key.to(torch.float32)
+            v_t = value.to(torch.float32)
+
+        q_b = q_t.permute(0, 2, 1, 3).reshape(batch_size * self.num_heads, seq_len, self.head_dim).contiguous()
+        k_b = k_t.permute(0, 2, 1, 3).reshape(batch_size * self.num_heads, seq_len, self.head_dim).contiguous()
+        v_b = v_t.permute(0, 2, 1, 3).reshape(batch_size * self.num_heads, seq_len, self.head_dim).contiguous()
+
+        neg_k_t = (-k_b).transpose(1, 2).contiguous()
+        max_diff = _tg_maxplus_bmm(q_b, neg_k_t)
+        min_diff = _tg_minplus_bmm(q_b, neg_k_t)
+        attn_scores = -(max_diff - min_diff)
+
+        context = _tg_maxplus_bmm(attn_scores, v_b)
+        context = context.reshape(batch_size, self.num_heads, seq_len, self.head_dim).permute(0, 2, 1, 3)
+
+        if self.valuation_map:
+            attn_output = torch.expm1(context).to(hidden_states.dtype)
+        else:
+            attn_output = context.to(hidden_states.dtype)
+
+        attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)
+        return self.o_proj(attn_output)
+
+
 class SwiGLU(nn.Module):
     def __init__(self, hidden_size: int, expansion: float, mlp_dropout: float = 0.0):
         super().__init__()

@@ -15,6 +15,7 @@ from models.layers import (
     CastedLinear,
     TropicalAttention,
     TropicalAttentionV3,
+    TropicalAttentionV4,
 )
 from models.sparse_embedding import CastedSparseEmbedding
 
@@ -62,8 +63,10 @@ class TARMBlock(nn.Module):
             attention_cls = TropicalAttention
         elif config.tropical_attention_version == "v3":
             attention_cls = TropicalAttentionV3
+        elif config.tropical_attention_version == "v4":
+            attention_cls = TropicalAttentionV4
         else:
-            raise ValueError("tropical_attention_version must be one of: 'v1', 'v3'.")
+            raise ValueError("tropical_attention_version must be one of: 'v1', 'v3', 'v4'.")
 
         self.self_attn = attention_cls(
             hidden_size=config.hidden_size,
