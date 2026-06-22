@@ -1,0 +1,52 @@
+name: TAPR.tapr@TAPR
+loss:
+  name: TAPR.tapr@TAPRLossHead
+  loss_type: stablemax_cross_entropy
+
+# Maximum ponder/recurrent steps.
+loops: 24
+H_cycles: 1
+L_cycles: 2
+
+num_layers: 2
+hidden_size: 512
+num_heads: 8
+expansion: 4
+
+puzzle_emb_ndim: ${.hidden_size}
+pos_encodings: rope
+
+# Tropical Attention core.
+tropical_attention_version: v3
+tropical_proj: true
+tropical_qkv_proj: false
+tropical_norm: none
+q_dropout: 0.0
+k_dropout: 0.0
+v_dropout: 0.0
+
+# PonderNet-style adaptive compute. Training integrates the full distribution
+# until loops; eval halts early at ponder_eval_threshold unless forced by loops.
+ponder_enabled: true
+ponder_min_steps: 2
+ponder_eval_threshold: 0.55
+ponder_prior_lambda: 0.18
+ponder_step_cost: 0.001
+ponder_kl_weight: 0.01
+ponder_entropy_weight: 0.0
+halt_correctness_weight: 0.05
+disable_halting: false
+
+# NextLat-style latent prediction.
+nextlat_enabled: true
+nextlat_weight: 0.10
+nextlat_loss_type: projective
+tapr_distance_mode: hilbert
+fw_bias: 0.5
+
+# Tropical polynomial chart transition.
+chart_transition: true
+chart_count: 4
+chart_transition_strength: 0.25
+
+forward_dtype: bfloat16
