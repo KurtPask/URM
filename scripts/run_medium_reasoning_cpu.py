@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import models.layers as layers
+from models.losses import IGNORE_LABEL_ID
 
 
 def install_torch_tropical_fallback() -> None:
@@ -64,6 +65,12 @@ class ArrayDataset:
     ood_labels: Optional[np.ndarray]
     vocab_size: int
     seq_len: int
+    train_puzzle_identifiers: Optional[np.ndarray] = None
+    test_puzzle_identifiers: Optional[np.ndarray] = None
+    ood_puzzle_identifiers: Optional[np.ndarray] = None
+    num_puzzle_identifiers: int = 1
+    puzzle_emb_ndim: int = 0
+    ignore_label_id: Optional[int] = None
     task_residual_type: str = "none"
     grid_size: int = 0
     clrs_nodes: int = 0
@@ -167,6 +174,42 @@ def load_sudoku(data_path: Path, cache_path: Path, *, train_limit: int, test_lim
         seq_len=81,
         task_residual_type="sudoku_constraints",
         grid_size=9,
+    )
+
+
+def _load_arc_split(data_path: Path, split: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    split_path = data_path / split
+    metadata = json.loads((split_path / "dataset.json").read_text(encoding="utf-8"))
+    inputs = np.load(split_path / "all__inputs.npy", mmap_mode="r")
+    labels = np.load(split_path / "all__labels.npy", mmap_mode="r")
+    puzzle_identifiers = np.load(split_path / "all__puzzle_identifiers.npy", mmap_mode="r")
+    puzzle_indices = np.load(split_path / "all__puzzle_indices.npy", mmap_mode="r")
+    example_puzzle_indices = np.searchsorted(puzzle_indices, np.arange(inputs.shape[0]), side="right") - 1
+    example_identifiers = np.asarray(puzzle_identifiers[example_puzzle_indices], dtype=np.int64)
+    return inputs, labels, example_identifiers, int(metadata["num_puzzle_identifiers"])
+
+
+def load_arc(data_path: Path, *, name: str, hidden_size: int) -> ArrayDataset:
+    train_inputs, train_labels, train_ids, train_num_ids = _load_arc_split(data_path, "train")
+    test_inputs, test_labels, test_ids, test_num_ids = _load_arc_split(data_path, "test")
+    metadata = json.loads((data_path / "train" / "dataset.json").read_text(encoding="utf-8"))
+    num_puzzle_identifiers = max(train_num_ids, test_num_ids)
+    return ArrayDataset(
+        name=name,
+        train_inputs=train_inputs,
+        train_labels=train_labels,
+        test_inputs=test_inputs,
+        test_labels=test_labels,
+        ood_inputs=None,
+        ood_labels=None,
+        vocab_size=int(metadata["vocab_size"]),
+        seq_len=int(metadata["seq_len"]),
+        train_puzzle_identifiers=train_ids,
+        test_puzzle_identifiers=test_ids,
+        num_puzzle_identifiers=num_puzzle_identifiers,
+        puzzle_emb_ndim=hidden_size,
+        ignore_label_id=int(metadata.get("ignore_label_id", 0)),
+        task_residual_type="none",
     )
 
 
@@ -455,11 +498,27 @@ def make_clrs_shortest_path_dataset(
     )
 
 
-def make_batch(inputs: np.ndarray, labels: np.ndarray, indices: np.ndarray, device: torch.device) -> Dict[str, torch.Tensor]:
+def make_batch(
+    inputs: np.ndarray,
+    labels: np.ndarray,
+    indices: np.ndarray,
+    device: torch.device,
+    *,
+    puzzle_identifiers: Optional[np.ndarray] = None,
+    ignore_label_id: Optional[int] = None,
+) -> Dict[str, torch.Tensor]:
+    labels_np = np.asarray(labels[indices], dtype=np.int64)
+    if ignore_label_id is not None:
+        labels_np = labels_np.copy()
+        labels_np[labels_np == ignore_label_id] = IGNORE_LABEL_ID
+    if puzzle_identifiers is None:
+        puzzle_ids = np.zeros(indices.shape[0], dtype=np.int64)
+    else:
+        puzzle_ids = np.asarray(puzzle_identifiers[indices], dtype=np.int64)
     return {
         "inputs": torch.from_numpy(np.asarray(inputs[indices], dtype=np.int32)).to(device),
-        "labels": torch.from_numpy(np.asarray(labels[indices], dtype=np.int64)).to(device),
-        "puzzle_identifiers": torch.zeros(indices.shape[0], dtype=torch.int32, device=device),
+        "labels": torch.from_numpy(labels_np).to(device),
+        "puzzle_identifiers": torch.from_numpy(puzzle_ids.astype(np.int32)).to(device),
     }
 
 
@@ -467,8 +526,8 @@ def base_config(args: argparse.Namespace, dataset: ArrayDataset) -> Dict[str, ob
     return {
         "batch_size": args.batch_size,
         "seq_len": dataset.seq_len,
-        "puzzle_emb_ndim": 0,
-        "num_puzzle_identifiers": 1,
+        "puzzle_emb_ndim": dataset.puzzle_emb_ndim,
+        "num_puzzle_identifiers": dataset.num_puzzle_identifiers,
         "vocab_size": dataset.vocab_size,
         "num_layers": args.num_layers,
         "hidden_size": args.hidden_size,
@@ -588,7 +647,7 @@ def variants(args: argparse.Namespace, dataset: ArrayDataset) -> List[Variant]:
         "chart_transition": False,
         "task_residual_weight": 0.0,
     }
-    return [
+    selected = [
         Variant("URM", URM, dict(common)),
         Variant("TARM-v3", TARM, dict(tarm)),
         Variant("TAPR-PureTARM-v3", TAPR, dict(pure_tropical_transformer), tapr_loss=False),
@@ -597,6 +656,13 @@ def variants(args: argparse.Namespace, dataset: ArrayDataset) -> List[Variant]:
         Variant("TAPR-NextLat", TAPR, dict(tapr_nextlat), tapr_loss=True),
         Variant("TAPR-Full", TAPR, dict(tapr_full), tapr_loss=True),
     ]
+    if args.variants:
+        wanted = set(args.variants)
+        selected = [variant for variant in selected if variant.name in wanted]
+        missing = wanted.difference({variant.name for variant in selected})
+        if missing:
+            raise ValueError(f"Unknown variant name(s): {sorted(missing)}")
+    return selected
 
 
 def run_model_to_halt(model, batch: Dict[str, torch.Tensor], *, loss_head: Optional[TAPRLossHead] = None):
@@ -665,7 +731,14 @@ def train_variant(
 
     for step in range(1, args.train_steps + 1):
         indices = rng.integers(0, train_size, size=args.batch_size, dtype=np.int64)
-        batch = make_batch(dataset.train_inputs, dataset.train_labels, indices, device)
+        batch = make_batch(
+            dataset.train_inputs,
+            dataset.train_labels,
+            indices,
+            device,
+            puzzle_identifiers=dataset.train_puzzle_identifiers,
+            ignore_label_id=dataset.ignore_label_id,
+        )
         optimizer.zero_grad(set_to_none=True)
 
         if loss_head is None:
@@ -754,6 +827,8 @@ def evaluate_variant(
     args: argparse.Namespace,
     device: torch.device,
     prefix: str,
+    puzzle_identifiers: Optional[np.ndarray] = None,
+    ignore_label_id: Optional[int] = None,
 ) -> Dict[str, float]:
     model.eval()
     total_examples = min(args.eval_examples, int(inputs.shape[0]))
@@ -778,7 +853,14 @@ def evaluate_variant(
     with torch.inference_mode():
         for start in range(0, total_examples, args.eval_batch_size):
             stop = min(total_examples, start + args.eval_batch_size)
-            batch = make_batch(inputs, labels_np, np.arange(start, stop, dtype=np.int64), device)
+            batch = make_batch(
+                inputs,
+                labels_np,
+                np.arange(start, stop, dtype=np.int64),
+                device,
+                puzzle_identifiers=puzzle_identifiers,
+                ignore_label_id=ignore_label_id,
+            )
             carry = model.initial_carry(batch)
             outputs = None
             step_idx = 0
@@ -864,8 +946,11 @@ def main() -> None:
     parser.add_argument("--sudoku-data-path", type=Path, default=Path("data/sudoku-extreme-cpu-ablation"))
     parser.add_argument("--sudoku-cache-path", type=Path, default=Path("eval_results/cache/sudoku-extreme-medium"))
     parser.add_argument("--sudoku-train-limit", type=int, default=128)
+    parser.add_argument("--arc1-data-path", type=Path, default=Path("data/arc1concept-aug-16-cpu"))
+    parser.add_argument("--arc2-data-path", type=Path, default=Path("data/arc2concept-aug-16-cpu"))
     parser.add_argument("--output-dir", type=Path, default=Path("eval_results/medium_urm_tarm_tapr_cpu"))
     parser.add_argument("--tasks", nargs="+", default=["sudoku", "maze"])
+    parser.add_argument("--variants", nargs="*", default=None)
     parser.add_argument("--train-steps", type=int, default=300)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--eval-batch-size", type=int, default=8)
@@ -931,6 +1016,10 @@ def main() -> None:
                 test_limit=max(args.eval_examples, args.eval_batch_size),
             )
         )
+    if "arc1" in args.tasks or "arc-agi-1" in args.tasks:
+        datasets.append(load_arc(args.arc1_data_path, name="arcagi1_public", hidden_size=args.hidden_size))
+    if "arc2" in args.tasks or "arc-agi-2" in args.tasks:
+        datasets.append(load_arc(args.arc2_data_path, name="arcagi2_public", hidden_size=args.hidden_size))
     if "maze" in args.tasks:
         datasets.append(
             make_maze_dataset(
@@ -989,9 +1078,33 @@ def main() -> None:
                 "halt_head_type": str(variant.config.get("halt_head_type", "q_pair")),
                 **train_metrics,
             }
-            row.update(evaluate_variant(model, variant, dataset.test_inputs, dataset.test_labels, args=args, device=device, prefix="test"))
+            row.update(
+                evaluate_variant(
+                    model,
+                    variant,
+                    dataset.test_inputs,
+                    dataset.test_labels,
+                    args=args,
+                    device=device,
+                    prefix="test",
+                    puzzle_identifiers=dataset.test_puzzle_identifiers,
+                    ignore_label_id=dataset.ignore_label_id,
+                )
+            )
             if dataset.ood_inputs is not None and dataset.ood_labels is not None:
-                row.update(evaluate_variant(model, variant, dataset.ood_inputs, dataset.ood_labels, args=args, device=device, prefix="ood"))
+                row.update(
+                    evaluate_variant(
+                        model,
+                        variant,
+                        dataset.ood_inputs,
+                        dataset.ood_labels,
+                        args=args,
+                        device=device,
+                        prefix="ood",
+                        puzzle_identifiers=dataset.ood_puzzle_identifiers,
+                        ignore_label_id=dataset.ignore_label_id,
+                    )
+                )
             rows.append(row)
             print(json.dumps(row, sort_keys=True), flush=True)
 
