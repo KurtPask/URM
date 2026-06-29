@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Tuple, Dict, Optional
 from dataclasses import dataclass, replace
 import math
