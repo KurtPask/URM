@@ -7,6 +7,8 @@ TAPR is a TARM-derived recurrent reasoning model with three additions:
 - PonderNet trains a halting distribution over recurrent steps and enables early exit at evaluation time.
 
 The model class is `TAPR.tapr@TAPR`; the loss head is `TAPR.tapr@TAPRLossHead`.
+Use `arch=tapr_full` for the trajectory-trained model. The older `arch=tapr`
+configuration remains available for legacy experiments and is not TAPR-Full.
 
 ## Recurrent Step
 
@@ -20,19 +22,26 @@ logits_t = Decoder(z_{t+1})
 halt_t = HaltHead(z_{t+1}, nextlat_error, state_delta, logit_delta, step_fraction)
 ```
 
-Training runs the full halting distribution until `loops`; evaluation can stop early.
+For `tapr_architecture=clean_full`, the loss head runs every recurrent step on
+one batch, constructs the complete halting distribution, and performs one
+backward/optimizer update for that trajectory. Evaluation reports both the
+forced-final endpoint and the configured online stopping policy.
 
 ## Loss
 
 `TAPRLossHead` optimizes:
 
 ```text
-pondered task loss
-+ nextlat_weight * latent prediction loss
-+ ponder_kl_weight * KL(halting distribution || geometric prior)
-+ ponder_step_cost * expected steps
-+ halt_correctness_weight * halt calibration loss
+final_ce_weight * final-step task loss
++ ponder_ce_weight * expected task loss under p_n
++ nextlat_weight * CE-normalized latent prediction loss
++ ponder_kl_weight * KL(p || shifted truncated geometric prior)
++ optional task consistency and solution-score losses
 ```
+
+TAPR-Full rejects `halt_correctness_weight != 0`. PonderNet's halt probability
+is a compute-allocation variable, not a correctness probability. ARC candidate
+ranking instead uses the separately trained `solution_score_logits` output.
 
 The NextLat projective loss can use:
 
@@ -50,20 +59,38 @@ The loss head emits:
 
 - `accuracy`
 - `exact_accuracy`
-- `accuracy_per_step`
+- `adaptive_accuracy`
+- `adaptive_exact_accuracy`
+- `accuracy_per_compute`
 - `steps`
+- `full_steps`
 - `ponder_expected_steps`
-- `ponder_prob`
 - `ponder_mass`
-- `ponder_alive`
-- `halt_prob`
+- `ponder_mass_error`
+- per-step `accuracy_step_N`, `exact_accuracy_step_N`, `halt_lambda_step_N`,
+  `ponder_prob_step_N`, `ponder_mass_step_N`, and `nextlat_step_N`
 - `over_halt_rate`
 - `under_halt_rate`
 - `halt_brier`
+- `solution_score_brier`
 - `nextlat_loss`
 - `state_delta`
 - `logit_delta`
 - `chart_margin`
 - `chart_gate`
 
-These metrics are logged by the existing `pretrain.py` loop.
+Per-step metrics are emitted during evaluation by default; logging them for every
+training update can be enabled with `log_train_step_metrics=true`.
+
+## ARC launcher
+
+Run the explicit production configuration with:
+
+```bash
+scripts/TAPR_full_arc.sh
+```
+
+The launcher derives a memory-conscious per-rank batch size, uses gradient
+accumulation to target an effective batch of 128, clips full-trajectory
+gradients, evaluates only the configured 18-step depth, and ranks ARC candidates
+with `solution_score_logits` rather than the halt head.

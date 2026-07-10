@@ -3,6 +3,8 @@ loss:
   name: TAPR.tapr@TAPRLossHead
   loss_type: stablemax_cross_entropy
 
+# Legacy segment-wise TAPR configuration. This file intentionally preserves old
+# experiments; use arch=tapr_full for joint-trajectory PonderNet training.
 # Maximum ponder/recurrent steps.
 loops: 24
 H_cycles: 1
@@ -25,8 +27,8 @@ q_dropout: 0.0
 k_dropout: 0.0
 v_dropout: 0.0
 
-# PonderNet-style adaptive compute. Training integrates the full distribution
-# until loops; eval halts early at ponder_eval_threshold unless forced by loops.
+# Legacy adaptive-compute settings. This path does not construct one joint
+# trajectory graph in pretrain.py and is not TAPR-Full.
 ponder_enabled: true
 ponder_min_steps: 2
 ponder_eval_threshold: 0.55

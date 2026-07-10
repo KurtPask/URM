@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import math
 
 import torch
@@ -20,6 +20,7 @@ from models.layers import (
     TropicalAttention,
     TropicalAttentionV3,
     TropicalAttentionV4,
+    ToricBoundaryRouter,
 )
 from models.losses import IGNORE_LABEL_ID, stablemax_cross_entropy, softmax_cross_entropy
 from models.sparse_embedding import CastedSparseEmbedding
@@ -117,6 +118,8 @@ class TAPRConfig(BaseModel):
     ponder_min_steps: int = 2
     readout_every: int = 1
     ponder_eval_threshold: float = 0.5
+    ponder_eval_mode: str = "threshold"
+    ponder_eval_cdf_threshold: float = 0.5
     ponder_prior_lambda: float = 0.2
     ponder_step_cost: float = 0.0
     ponder_kl_weight: float = 0.01
@@ -132,6 +135,14 @@ class TAPRConfig(BaseModel):
     halt_head_type: str = "q_pair"
     ponder_ce_weight: float = 1.0
     final_ce_weight: float = 0.0
+
+    # Solution quality is deliberately separate from the PonderNet stop head.
+    # ARC may use this score to rank augmented candidate outputs.
+    solution_score_enabled: bool = False
+    solution_score_weight: float = 0.0
+    solution_score_normalize_to_ce: bool = True
+    log_train_step_metrics: bool = False
+    log_eval_step_metrics: bool = True
 
     # NextLat-style predictive belief-state objective.
     nextlat_enabled: bool = True
@@ -159,6 +170,21 @@ class TAPRConfig(BaseModel):
     chart_count: int = 4
     chart_transition_strength: float = 0.25
 
+    # Optional toric-compactification boundary router around the whole block.
+    toric_router: bool = False
+    toric_route_dim: int = 4
+    toric_gate_tau: float = 1.0
+    toric_gate_temp: float = 0.5
+    toric_dir_tau: float = 0.25
+    toric_dir_temp: float = 0.1
+    toric_learn_thresholds: bool = False
+    toric_gate_mode: str = "calibrated"
+    toric_gate_quantile: float = 0.95
+    toric_gate_ema: float = 0.05
+    toric_gate_stat: str = "route_norm"
+    toric_pinv_ridge: float = 1e-3
+    toric_partition_mode: str = "hard"
+
 
 class TAPRBlock(nn.Module):
     def __init__(self, config: TAPRConfig) -> None:
@@ -185,18 +211,46 @@ class TAPRBlock(nn.Module):
             k_dropout=config.k_dropout,
             v_dropout=config.v_dropout,
         )
+        self.toric_router = None
+        if config.toric_router:
+            self.toric_router = ToricBoundaryRouter(
+                hidden_size=config.hidden_size,
+                route_dim=config.toric_route_dim,
+                gate_tau=config.toric_gate_tau,
+                gate_temp=config.toric_gate_temp,
+                dir_tau=config.toric_dir_tau,
+                dir_temp=config.toric_dir_temp,
+                learn_thresholds=config.toric_learn_thresholds,
+                gate_mode=config.toric_gate_mode,
+                gate_quantile=config.toric_gate_quantile,
+                gate_ema=config.toric_gate_ema,
+                gate_stat=config.toric_gate_stat,
+                pinv_ridge=config.toric_pinv_ridge,
+                partition_mode=config.toric_partition_mode,
+            )
+
         self.mlp = ConvSwiGLU(
             hidden_size=config.hidden_size,
             expansion=config.expansion,
         )
         self.norm_eps = config.rms_norm_eps
 
-    def forward(self, cos_sin: Optional[CosSin], hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_core(self, cos_sin: Optional[CosSin], hidden_states: torch.Tensor) -> torch.Tensor:
         attn_output = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
         hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
         mlp_output = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
         return hidden_states
+
+    def forward(self, cos_sin: Optional[CosSin], hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.toric_router is None:
+            return self._forward_core(cos_sin, hidden_states)
+
+        x_quot, alpha, fan_state = self.toric_router.project_input(hidden_states)
+        interior = self._forward_core(cos_sin, hidden_states)
+        boundary = self._forward_core(cos_sin, x_quot)
+        boundary = self.toric_router.project_output(boundary, fan_state)
+        return self.toric_router.blend(interior, boundary, alpha)
 
 
 class NextLatPredictor(nn.Module):
@@ -261,6 +315,35 @@ class TAPRInner(nn.Module):
                 raise ValueError("clean_full TAPR uses one recurrence clock: L_cycles must be 1.")
             if self.config.halt_head_type != "scalar":
                 raise ValueError("clean_full TAPR uses a scalar PonderNet halt head.")
+            if self.config.detach_recurrent_state:
+                raise ValueError("clean_full TAPR requires detach_recurrent_state=false.")
+            if self.config.detach_ponder_state:
+                raise ValueError("clean_full TAPR requires detach_ponder_state=false.")
+            if self.config.bptt_window < 0:
+                raise ValueError("clean_full TAPR requires bptt_window>=0 (0 means full BPTT).")
+            if self.config.halt_correctness_weight != 0:
+                raise ValueError("clean_full TAPR cannot combine PonderNet with halt_correctness_weight.")
+            if not self.config.ponder_enabled or self.config.disable_halting:
+                raise ValueError("clean_full TAPR requires PonderNet halting to be enabled.")
+            if self.config.nextlat_weight > 0 and not self.config.nextlat_enabled:
+                raise ValueError("nextlat_weight requires nextlat_enabled=true.")
+            if self.config.nextlat_enabled and self.config.nextlat_weight > 0:
+                if not self.config.nextlat_supervised_only:
+                    raise ValueError("clean_full NextLat must use supervised/decision tokens only.")
+                if not self.config.nextlat_normalize_to_ce:
+                    raise ValueError("clean_full NextLat must be normalized to the CE magnitude.")
+            if self.config.solution_score_weight > 0 and not self.config.solution_score_enabled:
+                raise ValueError("solution_score_weight requires solution_score_enabled=true.")
+            if self.config.ponder_min_steps < 1 or self.config.ponder_min_steps > self.config.loops:
+                raise ValueError("ponder_min_steps must be in [1, loops].")
+            if self.config.readout_every < 1:
+                raise ValueError("readout_every must be >= 1.")
+            if self.config.eval_halt_mode not in {"threshold", "cdf", "full"}:
+                raise ValueError("eval_halt_mode must be: threshold, cdf, or full.")
+            if not 0.0 < self.config.ponder_prior_lambda < 1.0:
+                raise ValueError("ponder_prior_lambda must be strictly between 0 and 1.")
+            if not 0.0 < self.config.ponder_eval_cdf_threshold <= 1.0:
+                raise ValueError("ponder_eval_cdf_threshold must be in (0, 1].")
         if self.config.halt_head_type not in {"q_pair", "scalar"}:
             raise ValueError("halt_head_type must be either 'q_pair' or 'scalar'.")
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
@@ -276,6 +359,11 @@ class TAPRInner(nn.Module):
         self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         halt_out_features = 1 if self.config.halt_head_type == "scalar" else 2
         self.halt_head = CastedLinear(self.config.hidden_size + 4, halt_out_features, bias=True)
+        self.solution_score_head = (
+            CastedLinear(self.config.hidden_size + 4, 1, bias=True)
+            if self.config.solution_score_enabled
+            else None
+        )
         self.nextlat = NextLatPredictor(self.config) if self.config.nextlat_enabled else None
         self.chart_transition = TropicalChartTransition(self.config) if self.config.chart_transition else None
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)
@@ -317,6 +405,10 @@ class TAPRInner(nn.Module):
                 self.halt_head.bias[0] = _logit(self.config.ponder_prior_lambda)
                 if self.config.halt_head_type == "q_pair":
                     self.halt_head.bias[1] = -_logit(self.config.ponder_prior_lambda)
+            if self.solution_score_head is not None:
+                self.solution_score_head.weight.zero_()
+                if self.solution_score_head.bias is not None:
+                    self.solution_score_head.bias.zero_()
 
         self.activation_probe = None
 
@@ -489,12 +581,20 @@ class TAPRInner(nn.Module):
             halt_logit = halt_raw[..., 0]
             q_continue_logits = halt_raw[..., 1]
 
+        solution_score_logits = None
+        if self.solution_score_head is not None:
+            solution_score_logits = self.solution_score_head(
+                halt_features.to(hidden_states.dtype)
+            ).squeeze(-1).to(torch.float32)
+
         aux = {
             "nextlat_loss": nextlat_loss,
             "state_delta": state_delta,
             "logit_delta": logit_delta,
             **chart_stats,
         }
+        if solution_score_logits is not None:
+            aux["solution_score_logits"] = solution_score_logits
 
         probe = getattr(self, "activation_probe", None)
         if probe is not None:
@@ -505,6 +605,8 @@ class TAPRInner(nn.Module):
             probe.record_tensor("halt_logit", halt_logit)
             if q_continue_logits is not None:
                 probe.record_tensor("q_continue_logits", q_continue_logits)
+            if solution_score_logits is not None:
+                probe.record_tensor("solution_score_logits", solution_score_logits)
             probe.record_tensor("tapr_nextlat_loss", nextlat_loss)
             probe.record_tensor("tapr_state_delta", state_delta)
 
@@ -542,6 +644,7 @@ class TAPR(nn.Module):
         carry: TAPRCarry,
         batch: Dict[str, torch.Tensor],
         compute_target_q: bool = False,
+        force_full_trajectory: bool = False,
     ) -> Tuple[TAPRCarry, Dict[str, torch.Tensor]]:
         del compute_target_q
 
@@ -603,17 +706,20 @@ class TAPR(nn.Module):
         mass_after = (mass_before + ponder_prob).clamp_max(1.0)
         expected_after = expected_before + ponder_prob * new_steps.to(torch.float32)
 
-        if self.training:
+        if self.training or force_full_trajectory:
             # Train the full PonderNet distribution until the forced final step.
             halted = is_last_step
         elif (not self.config.ponder_enabled) or self.config.disable_halting:
             halted = is_last_step
         elif self.config.eval_halt_mode == "full":
             halted = is_last_step
-        elif self.config.eval_halt_mode != "threshold":
-            raise ValueError("eval_halt_mode must be either 'threshold' or 'full'.")
         else:
-            deterministic_halt = halt_prob >= self.config.ponder_eval_threshold
+            if self.config.eval_halt_mode == "threshold":
+                deterministic_halt = halt_prob >= self.config.ponder_eval_threshold
+            elif self.config.eval_halt_mode == "cdf":
+                deterministic_halt = mass_after >= self.config.ponder_eval_cdf_threshold
+            else:
+                raise ValueError("eval_halt_mode must be: threshold, cdf, or full.")
             halted = (deterministic_halt & (~before_min)) | is_last_step
 
         outputs = {
@@ -635,6 +741,8 @@ class TAPR(nn.Module):
         }
         if q_continue_logits is not None:
             outputs["q_continue_logits"] = q_continue_logits
+        if "solution_score_logits" in aux:
+            outputs["solution_score_logits"] = aux["solution_score_logits"]
         if "chart_margin" in aux:
             outputs["chart_margin"] = aux["chart_margin"]
         if "chart_gate" in aux:
@@ -653,7 +761,13 @@ class TAPR(nn.Module):
         else:
             carry_current_hidden = carry_hidden
 
-        if self.config.bptt_window == 0:
+        if self.config.tapr_architecture == "clean_full":
+            # The survival product is cheap and must remain differentiable across
+            # every recurrent window even when the hidden state is truncated.
+            carry_ponder_alive = alive_after
+            carry_ponder_mass = mass_after
+            carry_ponder_expected_steps = expected_after
+        elif self.config.bptt_window == 0:
             carry_ponder_alive = alive_after
             carry_ponder_mass = mass_after
             carry_ponder_expected_steps = expected_after
@@ -702,10 +816,45 @@ class TAPRLossHead(nn.Module):
     def _prior_prob(self, steps: torch.Tensor, is_last_step: torch.Tensor) -> torch.Tensor:
         prior_lambda = getattr(self.config, "ponder_prior_lambda", 0.2)
         prior_lambda = min(max(float(prior_lambda), 1e-5), 1.0 - 1e-5)
-        step_f = steps.to(torch.float32).clamp_min(1.0)
-        prior = prior_lambda * torch.pow(torch.as_tensor(1.0 - prior_lambda, device=steps.device), step_f - 1.0)
-        tail = torch.pow(torch.as_tensor(1.0 - prior_lambda, device=steps.device), step_f - 1.0)
-        return torch.where(is_last_step, tail, prior).clamp_min(1e-8)
+        min_steps = max(1, min(int(getattr(self.config, "ponder_min_steps", 1)), self.config.loops))
+        readout_every = max(1, int(getattr(self.config, "readout_every", 1)))
+        first_decision = ((min_steps + readout_every - 1) // readout_every) * readout_every
+        num_nonfinal_decisions = (
+            0
+            if first_decision >= self.config.loops
+            else 1 + (self.config.loops - 1 - first_decision) // readout_every
+        )
+
+        step_i = steps.to(torch.long)
+        decision_index = torch.div(
+            (step_i - first_decision).clamp_min(0),
+            readout_every,
+            rounding_mode="floor",
+        ).to(torch.float32)
+        one_minus = torch.as_tensor(1.0 - prior_lambda, dtype=torch.float32, device=steps.device)
+        prior = prior_lambda * torch.pow(one_minus, decision_index)
+        tail = torch.pow(one_minus, num_nonfinal_decisions)
+        valid_decision = (step_i >= first_decision) & (step_i.remainder(readout_every) == 0)
+        prior = torch.where(valid_decision, prior, torch.zeros_like(prior))
+        return torch.where(is_last_step, tail, prior)
+
+    def _trajectory_prior(self, device: torch.device) -> torch.Tensor:
+        """Normalized shifted geometric prior over actual halt opportunities."""
+        loops = int(self.config.loops)
+        min_steps = max(1, min(int(self.config.ponder_min_steps), loops))
+        readout_every = max(1, int(self.config.readout_every))
+        prior_lambda = min(max(float(self.config.ponder_prior_lambda), 1e-5), 1.0 - 1e-5)
+        prior = torch.zeros(loops, dtype=torch.float32, device=device)
+        decision_steps = [
+            step
+            for step in range(1, loops)
+            if step >= min_steps and step % readout_every == 0
+        ]
+        one_minus = torch.as_tensor(1.0 - prior_lambda, dtype=torch.float32, device=device)
+        for decision_index, step in enumerate(decision_steps):
+            prior[step - 1] = prior_lambda * torch.pow(one_minus, decision_index)
+        prior[-1] = torch.pow(one_minus, len(decision_steps))
+        return prior
 
     def _normalize_aux(self, aux_loss: torch.Tensor, task_loss: torch.Tensor, enabled: bool) -> Tuple[torch.Tensor, torch.Tensor]:
         if not enabled:
@@ -826,7 +975,277 @@ class TAPRLossHead(nn.Module):
             return self._clrs_bellman_residual(logits, batch)
         raise ValueError(f"Unknown task_residual_type: {residual_type}")
 
-    def forward(
+    def _trajectory_policy_indices(
+        self,
+        halt_probs: torch.Tensor,
+        cumulative_mass: torch.Tensor,
+    ) -> torch.Tensor:
+        loops, batch_size = halt_probs.shape
+        steps = torch.arange(1, loops + 1, device=halt_probs.device)
+        allowed = steps.ge(int(self.config.ponder_min_steps)) & (
+            steps.remainder(max(1, int(self.config.readout_every))).eq(0) | steps.eq(loops)
+        )
+        if self.config.eval_halt_mode in {"threshold", "full"}:
+            triggered = halt_probs >= float(self.config.ponder_eval_threshold)
+        elif self.config.eval_halt_mode == "cdf":
+            triggered = cumulative_mass >= float(self.config.ponder_eval_cdf_threshold)
+        else:
+            raise ValueError("eval_halt_mode must be: threshold, cdf, or full.")
+        if self.config.eval_halt_mode == "full":
+            triggered = torch.zeros_like(triggered, dtype=torch.bool)
+        triggered = triggered & allowed[:, None]
+        triggered[-1] = True
+        return triggered.to(torch.int64).argmax(dim=0).reshape(batch_size)
+
+    def _forward_trajectory(
+        self,
+        return_keys: Set[str],
+        return_raw_outputs: bool,
+        **model_kwargs,
+    ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor], torch.Tensor]:
+        if self.config.tapr_architecture != "clean_full":
+            raise ValueError("Trajectory training is reserved for tapr_architecture=clean_full.")
+
+        batch = model_kwargs["batch"]
+        carry = self.initial_carry(batch)
+        labels = batch["labels"]
+        mask = labels != IGNORE_LABEL_ID
+        loss_counts = mask.sum(-1)
+        loss_divisor = loss_counts.clamp_min(1)
+        valid_examples = loss_counts > 0
+        count = valid_examples.sum().clamp_min(1).to(torch.float32)
+
+        ce_steps: List[torch.Tensor] = []
+        nextlat_steps: List[torch.Tensor] = []
+        residual_steps: List[torch.Tensor] = []
+        ponder_steps: List[torch.Tensor] = []
+        halt_steps: List[torch.Tensor] = []
+        mass_steps: List[torch.Tensor] = []
+        state_delta_steps: List[torch.Tensor] = []
+        logit_delta_steps: List[torch.Tensor] = []
+        cell_accuracy_steps: List[torch.Tensor] = []
+        exact_accuracy_steps: List[torch.Tensor] = []
+        prediction_steps: List[torch.Tensor] = []
+        solution_score_steps: List[torch.Tensor] = []
+        chart_margin_steps: List[torch.Tensor] = []
+        chart_gate_steps: List[torch.Tensor] = []
+        final_outputs: Dict[str, torch.Tensor] = {}
+
+        for _ in range(int(self.config.loops)):
+            carry, outputs = self.model(
+                carry=carry,
+                batch=batch,
+                compute_target_q=False,
+                force_full_trajectory=True,
+            )
+            logits = outputs["logits"]
+            token_loss = self.loss_fn(logits, labels, ignore_index=IGNORE_LABEL_ID)
+            ce_steps.append(token_loss.sum(-1) / loss_divisor)
+            nextlat_steps.append(outputs["nextlat_loss"].to(torch.float32))
+            residual_steps.append(self._task_residual_vec(logits, batch).to(torch.float32))
+            ponder_steps.append(outputs["ponder_prob"].to(torch.float32))
+            halt_steps.append(outputs["halt_prob"].to(torch.float32))
+            mass_steps.append(outputs["ponder_mass"].to(torch.float32))
+            state_delta_steps.append(outputs["state_delta"].to(torch.float32))
+            logit_delta_steps.append(outputs["logit_delta"].to(torch.float32))
+            if "solution_score_logits" in outputs:
+                solution_score_steps.append(outputs["solution_score_logits"].to(torch.float32))
+            if "chart_margin" in outputs:
+                chart_margin_steps.append(outputs["chart_margin"].to(torch.float32))
+            if "chart_gate" in outputs:
+                chart_gate_steps.append(outputs["chart_gate"].to(torch.float32))
+
+            with torch.no_grad():
+                preds = torch.argmax(logits, dim=-1)
+                is_correct = mask & preds.eq(labels)
+                cell_accuracy_steps.append(is_correct.to(torch.float32).sum(-1) / loss_divisor)
+                exact_accuracy_steps.append((is_correct.sum(-1) == loss_counts) & valid_examples)
+                prediction_steps.append(preds)
+            final_outputs = outputs
+
+        if not bool(carry.halted.all()):
+            raise RuntimeError("clean_full trajectory did not terminate at the configured loop count.")
+
+        ce = torch.stack(ce_steps, dim=0)
+        nextlat = torch.stack(nextlat_steps, dim=0)
+        residual = torch.stack(residual_steps, dim=0)
+        ponder_prob = torch.stack(ponder_steps, dim=0)
+        halt_prob = torch.stack(halt_steps, dim=0)
+        cumulative_mass = torch.stack(mass_steps, dim=0)
+        state_delta = torch.stack(state_delta_steps, dim=0)
+        logit_delta = torch.stack(logit_delta_steps, dim=0)
+        cell_accuracy = torch.stack(cell_accuracy_steps, dim=0)
+        exact_accuracy = torch.stack(exact_accuracy_steps, dim=0)
+        predictions = torch.stack(prediction_steps, dim=0)
+
+        prior = self._trajectory_prior(device=ce.device)
+        valid_prior = prior > 0
+        log_prior = prior.clamp_min(1e-12).log().unsqueeze(1)
+        kl_terms = torch.where(
+            valid_prior.unsqueeze(1),
+            ponder_prob * (ponder_prob.clamp_min(1e-12).log() - log_prior),
+            torch.zeros_like(ponder_prob),
+        )
+        ponder_kl_per_example = kl_terms.sum(dim=0)
+        ponder_kl = ponder_kl_per_example.sum()
+        ponder_entropy = -torch.where(
+            ponder_prob > 0,
+            ponder_prob * ponder_prob.clamp_min(1e-12).log(),
+            torch.zeros_like(ponder_prob),
+        ).sum()
+
+        step_numbers = torch.arange(1, self.config.loops + 1, dtype=torch.float32, device=ce.device).unsqueeze(1)
+        expected_steps = (ponder_prob * step_numbers).sum(dim=0)
+        ponder_mass = ponder_prob.sum(dim=0)
+        ponder_task_loss = (ponder_prob * ce).sum()
+        final_task_loss = ce[-1].sum()
+        task_loss = (
+            float(self.config.ponder_ce_weight) * ponder_task_loss
+            + float(self.config.final_ce_weight) * final_task_loss
+        )
+
+        # NextLat regularizes every recurrent transition. It is not survival-
+        # weighted, so the halt head cannot reduce this loss by stopping early.
+        nextlat_loss = nextlat.mean(dim=0).sum()
+        nextlat_term, nextlat_scale = self._normalize_aux(
+            nextlat_loss,
+            final_task_loss,
+            bool(self.config.nextlat_normalize_to_ce),
+        )
+        task_residual_loss = (ponder_prob * residual).sum()
+        task_residual_term, task_residual_scale = self._normalize_aux(
+            task_residual_loss,
+            final_task_loss,
+            bool(self.config.task_residual_normalize_to_ce),
+        )
+
+        solution_score_loss = torch.zeros((), dtype=torch.float32, device=ce.device)
+        solution_score_scale = torch.ones((), dtype=torch.float32, device=ce.device)
+        solution_scores = None
+        if solution_score_steps:
+            solution_scores = torch.stack(solution_score_steps, dim=0)
+            raw_solution_score_loss = F.binary_cross_entropy_with_logits(
+                solution_scores,
+                cell_accuracy.detach(),
+                reduction="none",
+            ).mean(dim=0).sum()
+            solution_score_loss, solution_score_scale = self._normalize_aux(
+                raw_solution_score_loss,
+                final_task_loss,
+                bool(self.config.solution_score_normalize_to_ce),
+            )
+
+        total_loss = (
+            task_loss
+            + float(self.config.nextlat_weight) * nextlat_term
+            + float(self.config.task_residual_weight) * task_residual_term
+            + float(self.config.ponder_kl_weight) * ponder_kl
+            + float(self.config.ponder_step_cost) * expected_steps.sum()
+            - float(self.config.ponder_entropy_weight) * ponder_entropy
+            + float(self.config.solution_score_weight) * solution_score_loss
+        )
+
+        policy_indices = self._trajectory_policy_indices(halt_prob.detach(), cumulative_mass.detach())
+        batch_indices = torch.arange(policy_indices.shape[0], device=policy_indices.device)
+        policy_steps = policy_indices.to(torch.float32) + 1.0
+        adaptive_cell_accuracy = cell_accuracy[policy_indices, batch_indices]
+        adaptive_exact_accuracy = exact_accuracy[policy_indices, batch_indices]
+        adaptive_predictions = predictions[policy_indices, batch_indices]
+
+        exact_any = exact_accuracy.any(dim=0)
+        oracle_hits = exact_accuracy.clone()
+        oracle_hits[-1] |= ~exact_any
+        oracle_indices = oracle_hits.to(torch.int64).argmax(dim=0)
+        over_halt = policy_indices < oracle_indices
+        under_halt = exact_any & (policy_indices > oracle_indices)
+
+        decision_steps = torch.arange(1, self.config.loops + 1, device=ce.device)
+        decision_mask = decision_steps.ge(int(self.config.ponder_min_steps)) & (
+            decision_steps.remainder(max(1, int(self.config.readout_every))).eq(0)
+        ) & decision_steps.lt(int(self.config.loops))
+        if bool(decision_mask.any()):
+            halt_oracle_brier = (
+                halt_prob[decision_mask] - exact_accuracy[decision_mask].to(torch.float32)
+            ).pow(2).mean(dim=0).sum()
+        else:
+            halt_oracle_brier = torch.zeros((), dtype=torch.float32, device=ce.device)
+
+        solution_score_brier = torch.zeros((), dtype=torch.float32, device=ce.device)
+        if solution_scores is not None:
+            solution_score_brier = (
+                torch.sigmoid(solution_scores[-1]) - cell_accuracy[-1]
+            ).pow(2).sum()
+
+        metrics: Dict[str, torch.Tensor] = {
+            "count": count,
+            "accuracy": cell_accuracy[-1].sum(),
+            "exact_accuracy": exact_accuracy[-1].to(torch.float32).sum(),
+            "adaptive_accuracy": adaptive_cell_accuracy.sum(),
+            "adaptive_exact_accuracy": adaptive_exact_accuracy.to(torch.float32).sum(),
+            "accuracy_per_compute": (adaptive_cell_accuracy / policy_steps.clamp_min(1.0)).sum(),
+            "steps": policy_steps.sum(),
+            "full_steps": count * float(self.config.loops),
+            "ponder_expected_steps": expected_steps.detach().sum(),
+            "ponder_mass": ponder_mass.detach().sum(),
+            "ponder_mass_error": (ponder_mass.detach() - 1.0).abs().sum(),
+            "ponder_prior_mass": count * prior.sum().detach(),
+            "ponder_prob": ponder_prob[-1].detach().sum(),
+            "ponder_alive": count * 0.0,
+            "halt_prob": halt_prob[-1].detach().sum(),
+            "over_halt_rate": over_halt.to(torch.float32).sum(),
+            "under_halt_rate": under_halt.to(torch.float32).sum(),
+            "halt_brier": halt_oracle_brier.detach(),
+            "solution_score_brier": solution_score_brier.detach(),
+            "lm_loss": task_loss.detach(),
+            "ponder_ce_loss": ponder_task_loss.detach(),
+            "final_ce_loss": final_task_loss.detach(),
+            "nextlat_loss": nextlat_loss.detach(),
+            "nextlat_scale": nextlat_scale.detach() * count,
+            "task_residual_loss": task_residual_loss.detach(),
+            "task_residual_scale": task_residual_scale.detach() * count,
+            "ponder_kl_loss": ponder_kl.detach(),
+            "ponder_step_loss": expected_steps.detach().sum(),
+            "ponder_entropy": ponder_entropy.detach(),
+            "halt_correctness_loss": torch.zeros((), dtype=torch.float32, device=ce.device),
+            "solution_score_loss": solution_score_loss.detach(),
+            "solution_score_scale": solution_score_scale.detach() * count,
+            "state_delta": state_delta[-1].detach().sum(),
+            "logit_delta": logit_delta[-1].detach().sum(),
+        }
+
+        log_step_metrics = (
+            self.training and self.config.log_train_step_metrics
+        ) or (
+            (not self.training) and self.config.log_eval_step_metrics
+        )
+        if log_step_metrics:
+            for step_index in range(self.config.loops):
+                suffix = f"step_{step_index + 1:02d}"
+                metrics[f"accuracy_{suffix}"] = cell_accuracy[step_index].sum()
+                metrics[f"exact_accuracy_{suffix}"] = exact_accuracy[step_index].to(torch.float32).sum()
+                metrics[f"halt_lambda_{suffix}"] = halt_prob[step_index].detach().sum()
+                metrics[f"ponder_prob_{suffix}"] = ponder_prob[step_index].detach().sum()
+                metrics[f"ponder_mass_{suffix}"] = cumulative_mass[step_index].detach().sum()
+                metrics[f"nextlat_{suffix}"] = nextlat[step_index].detach().sum()
+                metrics[f"state_delta_{suffix}"] = state_delta[step_index].detach().sum()
+                metrics[f"logit_delta_{suffix}"] = logit_delta[step_index].detach().sum()
+                if chart_margin_steps:
+                    metrics[f"chart_margin_{suffix}"] = chart_margin_steps[step_index].detach().sum()
+                if chart_gate_steps:
+                    metrics[f"chart_gate_{suffix}"] = chart_gate_steps[step_index].detach().sum()
+
+        final_outputs["preds"] = predictions[-1]
+        final_outputs["adaptive_preds"] = adaptive_predictions
+        returned_outputs: Dict[str, torch.Tensor] = {}
+        if return_raw_outputs:
+            returned_outputs["raw_outputs"] = final_outputs
+        for key in return_keys:
+            if key in final_outputs:
+                returned_outputs[key] = final_outputs[key].detach()
+
+        return carry, total_loss, metrics, returned_outputs, carry.halted.all()
+
+    def _forward_step(
         self,
         return_keys: Set[str],
         return_raw_outputs: bool = False,
@@ -876,11 +1295,16 @@ class TAPRLossHead(nn.Module):
         )
 
         prior = self._prior_prob(new_carry.steps, outputs["is_last_step"]).to(torch.float32)
-        ponder_kl = (
-            ponder_prob.clamp_min(1e-8)
-            * (ponder_prob.clamp_min(1e-8).log() - prior.log())
+        ponder_kl = torch.where(
+            ponder_prob > 0,
+            ponder_prob * (ponder_prob.clamp_min(1e-8).log() - prior.clamp_min(1e-8).log()),
+            torch.zeros_like(ponder_prob),
         ).sum()
-        ponder_entropy = -(ponder_prob.clamp_min(1e-8) * ponder_prob.clamp_min(1e-8).log()).sum()
+        ponder_entropy = -torch.where(
+            ponder_prob > 0,
+            ponder_prob * ponder_prob.clamp_min(1e-8).log(),
+            torch.zeros_like(ponder_prob),
+        ).sum()
         expected_step_loss = (ponder_prob * new_carry.steps.to(torch.float32)).sum()
 
         nextlat_weight = getattr(self.config, "nextlat_weight", 0.0)
@@ -944,9 +1368,9 @@ class TAPRLossHead(nn.Module):
             "ponder_ce_loss": ponder_task_loss.detach(),
             "final_ce_loss": final_task_loss.detach(),
             "nextlat_loss": nextlat_loss.detach(),
-            "nextlat_scale": nextlat_scale.detach(),
+            "nextlat_scale": nextlat_scale.detach() * count,
             "task_residual_loss": task_residual_loss.detach(),
-            "task_residual_scale": task_residual_scale.detach(),
+            "task_residual_scale": task_residual_scale.detach() * count,
             "ponder_kl_loss": ponder_kl.detach(),
             "ponder_step_loss": expected_step_loss.detach(),
             "ponder_entropy": ponder_entropy.detach(),
@@ -981,6 +1405,25 @@ class TAPRLossHead(nn.Module):
             metrics,
             returned_outputs,
             new_carry.halted.all(),
+        )
+
+    def forward(
+        self,
+        return_keys: Set[str],
+        return_raw_outputs: bool = False,
+        run_trajectory: bool = False,
+        **model_kwargs,
+    ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
+        if run_trajectory:
+            return self._forward_trajectory(
+                return_keys=return_keys,
+                return_raw_outputs=return_raw_outputs,
+                **model_kwargs,
+            )
+        return self._forward_step(
+            return_keys=return_keys,
+            return_raw_outputs=return_raw_outputs,
+            **model_kwargs,
         )
 
 

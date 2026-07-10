@@ -40,6 +40,25 @@ def unwrap(m: nn.Module) -> nn.Module:
     return m.module if hasattr(m, "module") else m
 
 
+def unwrap_runtime_model(model: nn.Module) -> nn.Module:
+    """Return the loss head beneath DDP and torch.compile wrappers."""
+    current = unwrap(model)
+    while hasattr(current, "_orig_mod"):
+        current = current._orig_mod  # type: ignore[attr-defined]
+    return current
+
+
+def get_reasoner_config(model: nn.Module):
+    loss_head = unwrap_runtime_model(model)
+    inner_model = getattr(loss_head, "model", None)
+    return getattr(inner_model, "config", None)
+
+
+def uses_full_trajectory(model: nn.Module) -> bool:
+    model_config = get_reasoner_config(model)
+    return getattr(model_config, "tapr_architecture", None) == "clean_full"
+
+
 class EMAHelper(object):
     def __init__(self, mu=0.999):
         self.mu = mu
@@ -151,6 +170,7 @@ class PretrainConfig(pydantic.BaseModel):
 
     # Gradient accumulation
     grad_accum_steps: int = 1
+    grad_clip_norm: Optional[float] = None
 
     # Names
     project_name: Optional[str] = "urm_tarm_activation_probe"
@@ -707,15 +727,18 @@ def train_batch(
 ):
     accum_steps = max(1, getattr(config, "grad_accum_steps", 1))
     if train_state.step >= train_state.total_steps:  # At most train_total_steps
-        return
+        return None, False
 
     # To device
     batch = {k: v.cuda() for k, v in batch.items()}
 
-    # Init carry if it is None
-    if train_state.carry is None:
+    trajectory_training = uses_full_trajectory(train_state.model)
+
+    # Legacy ACT models carry active examples across dataloader batches. TAPR-
+    # Full instead owns one complete recurrent trajectory per fetched batch.
+    if not trajectory_training and train_state.carry is None:
         with torch.device("cuda"):
-            train_state.carry = unwrap(train_state.model).initial_carry(batch)  # type: ignore #unwrap
+            train_state.carry = unwrap_runtime_model(train_state.model).initial_carry(batch)  # type: ignore
 
     for optimizer in train_state.optimizers:
         if hasattr(optimizer, "train"):
@@ -730,18 +753,39 @@ def train_batch(
             arch_name=config.arch.name,
         )
 
-    compute_target_q = train_state.step % config.target_q_update_every == 0
-    train_state.carry, loss, metrics, _, _ = train_state.model(
-        carry=train_state.carry, batch=batch, return_keys=[], compute_target_q=compute_target_q
-    )
+    if trajectory_training:
+        _, loss, metrics, _, _ = train_state.model(
+            carry=None,
+            batch=batch,
+            return_keys=set(),
+            compute_target_q=False,
+            run_trajectory=True,
+        )
+        train_state.carry = None
+    else:
+        compute_target_q = train_state.step % config.target_q_update_every == 0
+        train_state.carry, loss, metrics, _, _ = train_state.model(
+            carry=train_state.carry,
+            batch=batch,
+            return_keys=set(),
+            compute_target_q=compute_target_q,
+        )
 
-    loss_scale = 1.0 / (global_batch_size * accum_steps)
+    # DDP averages gradients across ranks, so each local summed loss must be
+    # divided by the local batch size rather than by the global batch twice.
+    loss_scale = world_size / (global_batch_size * accum_steps)
     (loss_scale * loss).backward()
     train_state.accum_step += 1
 
     should_step = train_state.accum_step % accum_steps == 0
     if not should_step:
-        return
+        return None, False
+
+    if config.grad_clip_norm is not None and config.grad_clip_norm > 0:
+        torch.nn.utils.clip_grad_norm_(
+            train_state.model.parameters(),
+            max_norm=float(config.grad_clip_norm),
+        )
 
     # \/ \/ \/ commenting out in attempt to speed up \/ \/ \/ 
     # Allreduce
@@ -803,7 +847,9 @@ def train_batch(
             reduced_metrics = {f"train/{k}": _normalize_metric(k, v) for k, v in reduced_metrics.items()}
 
             reduced_metrics["train/lr"] = lr_this_step
-            return reduced_metrics
+            return reduced_metrics, True
+
+    return None, True
 
 
 def evaluate(
@@ -848,19 +894,29 @@ def evaluate(
             
             # To device
             batch = {k: v.cuda() for k, v in batch.items()}
-            with torch.device("cuda"):
-                carry = unwrap(train_state.model).initial_carry(batch)  # type: ignore #unwrap
-
-            # Forward
-            inference_steps = 0
-            while True:
+            trajectory_evaluation = uses_full_trajectory(train_state.model)
+            if trajectory_evaluation:
                 carry, loss, metrics, preds, all_finish = train_state.model(
-                    carry=carry, batch=batch, return_keys=return_keys
+                    carry=None,
+                    batch=batch,
+                    return_keys=return_keys,
+                    run_trajectory=True,
                 )
-                inference_steps += 1
+                loop_config = get_reasoner_config(train_state.model)
+                inference_steps = int(loop_config.loops)
+            else:
+                with torch.device("cuda"):
+                    carry = unwrap_runtime_model(train_state.model).initial_carry(batch)  # type: ignore
 
-                if all_finish:
-                    break
+                inference_steps = 0
+                while True:
+                    carry, loss, metrics, preds, all_finish = train_state.model(
+                        carry=carry, batch=batch, return_keys=return_keys
+                    )
+                    inference_steps += 1
+
+                    if all_finish:
+                        break
 
             if rank == 0 and config.eval_log_every_n_batches > 0 and (
                 processed_batches == 1 or processed_batches % config.eval_log_every_n_batches == 0
@@ -987,8 +1043,7 @@ def save_code_and_config(config: PretrainConfig, save_dir: str):
 
 
 def _get_loop_config(model: nn.Module):
-    inner_model = getattr(model, "model", None)
-    model_config = getattr(inner_model, "config", None)
+    model_config = get_reasoner_config(model)
     if model_config is None or not hasattr(model_config, "loops"):
         return None
 
@@ -1144,12 +1199,12 @@ def launch(hydra_config: DictConfig):
         train_state.model.train()
 
         for set_name, batch, global_batch_size in train_loader:
-            metrics = train_batch(
+            metrics, optimizer_stepped = train_batch(
                 config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE, activation_probe=activation_probe
             )
 
             # EMA update
-            if config.ema and ema_helper is not None:
+            if optimizer_stepped and config.ema and ema_helper is not None:
                 ema_helper.update(train_state.model)
 
             if RANK == 0 and metrics is not None:

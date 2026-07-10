@@ -41,12 +41,28 @@ def _crop(grid: np.ndarray):
 class ARC:
     required_outputs = {"inputs", "puzzle_identifiers", "q_halt_logits", "preds"}
     
-    def __init__(self, data_path: str, eval_metadata: PuzzleDatasetMetadata, submission_K: int = 2, pass_Ks: Sequence[int] = (1, 2, 5, 10, 100, 1000), aggregated_voting: bool = True):
+    def __init__(
+        self,
+        data_path: str,
+        eval_metadata: PuzzleDatasetMetadata,
+        submission_K: int = 2,
+        pass_Ks: Sequence[int] = (1, 2, 5, 10, 100, 1000),
+        aggregated_voting: bool = True,
+        ranking_score: str = "q_halt_logits",
+    ):
         super().__init__()
+        if ranking_score not in {"q_halt_logits", "solution_score_logits", "frequency"}:
+            raise ValueError(
+                "ranking_score must be q_halt_logits, solution_score_logits, or frequency."
+            )
         self.pass_Ks = pass_Ks
         self.submission_K = submission_K
         self.aggregated_voting = aggregated_voting
         self.blank_identifier_id = eval_metadata.blank_identifier_id
+        self.ranking_score = ranking_score
+        self.required_outputs = {"inputs", "puzzle_identifiers", "preds"}
+        if ranking_score != "frequency":
+            self.required_outputs.add(ranking_score)
 
         # Majority vote evaluation settings
         self.maj_sample_sizes = (10, 100, 1000, 10000)
@@ -70,26 +86,33 @@ class ARC:
     def update_batch(self, batch: Dict[str, torch.Tensor], preds: Dict[str, torch.Tensor]):
         # Collect required outputs to CPU
         outputs = {}
-        q_values = None
-        q_log_probs = None
+        score_values = None
+        score_log_probs = None
 
         for collection in (batch, preds):
             for k, v in collection.items():
                 if k in self.required_outputs:
-                    if k == "q_halt_logits":
-                        q_values = v.to(torch.float64).sigmoid().cpu()
-                        q_log_probs = F.logsigmoid(v.to(torch.float64)).cpu()
+                    if k == self.ranking_score:
+                        score_values = v.to(torch.float64).sigmoid().cpu()
+                        score_log_probs = F.logsigmoid(v.to(torch.float64)).cpu()
                     else:
                         outputs[k] = v.cpu()
 
-        assert q_values is not None and q_log_probs is not None
+        if self.ranking_score == "frequency":
+            batch_size = outputs["puzzle_identifiers"].shape[0]
+            score_values = torch.full((batch_size,), 0.5, dtype=torch.float64)
+            score_log_probs = torch.full((batch_size,), -np.log(2.0), dtype=torch.float64)
+        if score_values is None or score_log_probs is None:
+            raise RuntimeError(f"ARC evaluator did not receive {self.ranking_score}.")
 
         # Remove padding from outputs
         mask = outputs["puzzle_identifiers"] != self.blank_identifier_id
         outputs = {k: v[mask] for k, v in outputs.items()}
 
         # Get predictions
-        for identifier, input, pred, q, q_log_prob in zip(outputs["puzzle_identifiers"].numpy(), outputs["inputs"].numpy(), outputs["preds"].numpy(), q_values.numpy(), q_log_probs.numpy()):
+        score_values = score_values[mask]
+        score_log_probs = score_log_probs[mask]
+        for identifier, input, pred, q, q_log_prob in zip(outputs["puzzle_identifiers"].numpy(), outputs["inputs"].numpy(), outputs["preds"].numpy(), score_values.numpy(), score_log_probs.numpy()):
             name = self.identifier_map[identifier]
             orig_name, _inverse_fn = inverse_aug(name)
 

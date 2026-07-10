@@ -1,0 +1,77 @@
+name: TAPR.tapr@TAPR
+loss:
+  name: TAPR.tapr@TAPRLossHead
+  loss_type: stablemax_cross_entropy
+
+# TAPR-Full has one recurrent clock. pretrain.py unrolls this complete
+# trajectory before one backward/optimizer step.
+tapr_architecture: clean_full
+loops: 18
+H_cycles: 1
+L_cycles: 1
+bptt_window: 0
+detach_recurrent_state: false
+detach_ponder_state: false
+
+num_layers: 1
+hidden_size: 192
+num_heads: 8
+expansion: 4
+puzzle_emb_ndim: ${.hidden_size}
+pos_encodings: rope
+forward_dtype: bfloat16
+
+# TARM-v3 Tropical Attention backbone.
+tropical_attention_version: v3
+tropical_proj: true
+tropical_qkv_proj: false
+tropical_norm: none
+q_dropout: 0.0
+k_dropout: 0.0
+v_dropout: 0.0
+
+# Differentiable PonderNet distribution. A shifted truncated geometric prior is
+# constructed over the actual readout opportunities.
+ponder_enabled: true
+disable_halting: false
+halt_head_type: scalar
+ponder_min_steps: 2
+readout_every: 1
+ponder_prior_lambda: 0.12
+ponder_kl_weight: 0.01
+ponder_step_cost: 0.0
+ponder_entropy_weight: 0.0
+halt_correctness_weight: 0.0
+ponder_ce_weight: 0.5
+final_ce_weight: 1.0
+eval_halt_mode: cdf
+ponder_eval_threshold: 0.5
+ponder_eval_cdf_threshold: 0.5
+
+# NextLat predicts the next supervised-token belief state. The online branch
+# remains differentiable; only the target is stop-gradiented.
+nextlat_enabled: true
+nextlat_weight: 0.05
+nextlat_loss_type: projective
+nextlat_supervised_only: true
+nextlat_normalize_to_ce: true
+aux_normalize_eps: 1.0e-6
+aux_normalize_max_scale: 10.0
+tapr_distance_mode: hilbert
+fw_bias: 0.5
+
+# Separate candidate-quality score for ARC ranking; never reuse the halt head.
+solution_score_enabled: true
+solution_score_weight: 0.02
+solution_score_normalize_to_ce: true
+log_train_step_metrics: false
+log_eval_step_metrics: true
+
+# Tropical polynomial transition. Keep configurable for the no-chart ablation.
+chart_transition: true
+chart_count: 4
+chart_transition_strength: 0.15
+
+task_residual_type: none
+task_residual_weight: 0.0
+toric_router: false

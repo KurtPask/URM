@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "Notice: scripts/TAPR_arc.sh is the legacy segment-wise launcher. Use scripts/TAPR_full_arc.sh for TAPR-Full." >&2
+
 optimizer_name="${OPTIMIZER_NAME:-schedulefree}"
 gpu_count="${SLURM_GPUS_ON_NODE:-1}"
 export MASTER_PORT="${MASTER_PORT:-$((20000 + (${SLURM_JOB_ID:-$$} % 20000)))}"
