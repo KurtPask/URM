@@ -804,6 +804,250 @@ class TropicalAttentionV3(TropicalAttention):
         return output
 
 
+class ToricBoundaryRouter(nn.Module):
+    """Braid-fan quotient and calibrated boundary gate for a whole block.
+
+    The router does not own the reasoner.  A caller should:
+
+      1. call ``project_input(x)`` to obtain ``pi_sigma(x)``, ``alpha`` and the
+         fan state selected by ``x``;
+      2. run the full block on both ``x`` and ``pi_sigma(x)``;
+      3. call ``project_output(boundary, state)`` so the boundary branch cannot
+         reintroduce the killed cone directions;
+      4. blend with ``blend(interior, boundary, alpha)``.
+
+    This is intentionally block-level.  Wrapping only attention lets residual and
+    MLP paths bypass the quotient, which is not a compactification of the block.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        route_dim: int = 4,
+        gate_tau: float = 1.0,
+        gate_temp: float = 0.5,
+        dir_tau: float = 0.25,
+        dir_temp: float = 0.1,
+        learn_thresholds: bool = False,
+        gate_mode: str = "calibrated",
+        gate_quantile: float = 0.95,
+        gate_ema: float = 0.05,
+        gate_stat: str = "route_norm",
+        pinv_ridge: float = 1e-3,
+        partition_mode: str = "hard",
+    ):
+        super().__init__()
+        if route_dim < 2:
+            raise ValueError("route_dim must be >= 2 for a non-trivial braid fan.")
+        if route_dim > hidden_size:
+            raise ValueError("route_dim must be <= hidden_size for a stable lifted quotient.")
+        if gate_mode not in {"calibrated", "frozen", "force_interior", "force_boundary"}:
+            raise ValueError("gate_mode must be: calibrated, frozen, force_interior, or force_boundary.")
+        if gate_stat not in {"route_norm", "route_mahalanobis"}:
+            raise ValueError("gate_stat must be: route_norm or route_mahalanobis.")
+        if partition_mode != "hard":
+            raise ValueError("Only hard braid-fan partitions are implemented.")
+
+        self.hidden_size = hidden_size
+        self.route_dim = route_dim
+        self.gate_mode = gate_mode
+        self.gate_quantile = float(gate_quantile)
+        self.gate_ema = float(gate_ema)
+        self.gate_margin = float(gate_tau)
+        self.gate_temp_multiplier = float(gate_temp)
+        self.gate_stat = gate_stat
+        self.pinv_ridge = float(pinv_ridge)
+        self.partition_mode = partition_mode
+
+        # Routing map W_route : R^H -> R^r.  The fan lives after centering
+        # modulo R*1 in route space.
+        self.route = CastedLinear(hidden_size, route_dim, bias=False)
+
+        def _inv_softplus(value: float) -> torch.Tensor:
+            value = max(float(value), 1e-4)
+            return torch.tensor(math.log(math.expm1(value)))
+
+        gap_tau_t = torch.tensor(float(dir_tau))
+        gap_log_temp_t = _inv_softplus(dir_temp)
+        if learn_thresholds:
+            self.gap_tau = nn.Parameter(gap_tau_t)
+            self._gap_log_temp = nn.Parameter(gap_log_temp_t)
+        else:
+            self.register_buffer("gap_tau", gap_tau_t, persistent=True)
+            self.register_buffer("_gap_log_temp", gap_log_temp_t, persistent=True)
+
+        self.register_buffer("gate_threshold", torch.tensor(float(gate_tau)), persistent=True)
+        self.register_buffer("gate_scale", torch.tensor(max(float(gate_temp), 1e-4)), persistent=True)
+        self.register_buffer("gate_steps", torch.zeros((), dtype=torch.long), persistent=True)
+        self.register_buffer("gate_feature_mean", torch.zeros(route_dim), persistent=True)
+        self.register_buffer("gate_feature_var", torch.ones(route_dim), persistent=True)
+
+        # Diagnostics (populated each forward; detached, for probing only).
+        self.last_alpha_mean: Optional[torch.Tensor] = None
+        self.last_block_count_mean: Optional[torch.Tensor] = None
+        self.last_gap_boundary_mean: Optional[torch.Tensor] = None
+        self.last_quotient_fraction_mean: Optional[torch.Tensor] = None
+        self.last_output_leakage_mean: Optional[torch.Tensor] = None
+        self.last_route_condition: Optional[torch.Tensor] = None
+
+    def _center_route(self, x: torch.Tensor) -> torch.Tensor:
+        u = self.route(x.to(torch.float32))
+        return u - u.mean(dim=-1, keepdim=True)
+
+    def _fan_state(self, u: torch.Tensor) -> dict:
+        """Select the braid-fan face by sorted gaps.
+
+        Large sorted gaps create block boundaries; small gaps remain in the same
+        ordered block.  The block IDs are returned in original route-coordinate
+        order, so the same quotient can be applied to outputs.
+        """
+        gap_temp = F.softplus(self._gap_log_temp).clamp_min(1e-4)
+        sorted_u, sort_idx = torch.sort(u, dim=-1)
+        gaps = sorted_u[..., 1:] - sorted_u[..., :-1]
+        boundary_soft = torch.sigmoid((gaps - self.gap_tau) / gap_temp)
+
+        with torch.no_grad():
+            boundary_hard = gaps > self.gap_tau
+            block_id_sorted = torch.cat(
+                [
+                    torch.zeros_like(boundary_hard[..., :1], dtype=torch.long),
+                    boundary_hard.to(torch.long).cumsum(dim=-1),
+                ],
+                dim=-1,
+            )
+            block_id = torch.empty_like(block_id_sorted)
+            block_id.scatter_(dim=-1, index=sort_idx, src=block_id_sorted)
+            block_count = block_id_sorted[..., -1].to(torch.float32) + 1.0
+
+        return {
+            "block_id": block_id,
+            "block_count": block_count,
+            "boundary_soft": boundary_soft,
+            "boundary_hard": boundary_hard,
+        }
+
+    def _block_level(self, values: torch.Tensor, block_id: torch.Tensor) -> torch.Tensor:
+        """Return the per-block constant component in route space."""
+        original_shape = values.shape
+        flat_values = values.reshape(-1, self.route_dim)
+        flat_ids = block_id.reshape(-1, self.route_dim)
+        membership = F.one_hot(flat_ids, num_classes=self.route_dim).to(flat_values.dtype)
+        counts = membership.sum(dim=1).clamp_min(1.0)
+        sums = torch.einsum("nrc,nr->nc", membership, flat_values)
+        means = sums / counts
+        level = torch.gather(means, dim=1, index=flat_ids)
+        return level.reshape(original_shape)
+
+    def _lift_route(self, route_values: torch.Tensor) -> torch.Tensor:
+        """Lift route-space cone components through a ridge pseudo-inverse."""
+        weight = self.route.weight.to(torch.float32)  # [r, H]
+        gram = weight @ weight.transpose(0, 1)
+        eye = torch.eye(self.route_dim, dtype=gram.dtype, device=gram.device)
+        ridge_scale = gram.diagonal().mean().detach().clamp_min(1e-6)
+        gram = gram + self.pinv_ridge * ridge_scale * eye
+
+        flat = route_values.reshape(-1, self.route_dim)
+        coeff = torch.linalg.solve(gram, flat.transpose(0, 1)).transpose(0, 1)
+        lifted = coeff @ weight
+
+        with torch.no_grad():
+            singular = torch.linalg.svdvals(weight)
+            self.last_route_condition = (
+                singular.max() / singular.min().clamp_min(1e-6)
+            ).detach()
+
+        return lifted.reshape(*route_values.shape[:-1], self.hidden_size)
+
+    def _gate_statistic(self, u: torch.Tensor) -> torch.Tensor:
+        if self.gate_stat == "route_mahalanobis":
+            mean = self.gate_feature_mean.to(u.device, dtype=u.dtype)
+            var = self.gate_feature_var.to(u.device, dtype=u.dtype).clamp_min(1e-6)
+            z = (u - mean.view(*([1] * (u.ndim - 1)), -1)) / torch.sqrt(var.view(*([1] * (u.ndim - 1)), -1))
+            return torch.linalg.vector_norm(z, dim=-1, keepdim=True) / math.sqrt(self.route_dim)
+        return torch.linalg.vector_norm(u, dim=-1, keepdim=True)
+
+    @torch.no_grad()
+    def _update_gate_calibration(self, u: torch.Tensor, stat: torch.Tensor) -> None:
+        flat_u = u.detach().reshape(-1, self.route_dim)
+        flat_stat = stat.detach().reshape(-1)
+        if flat_stat.numel() == 0:
+            return
+
+        batch_mean = flat_u.mean(dim=0)
+        batch_var = flat_u.var(dim=0, unbiased=False).clamp_min(1e-6)
+        q = min(max(self.gate_quantile, 0.5), 0.999)
+        hi = torch.quantile(flat_stat, q)
+        med = torch.quantile(flat_stat, 0.5)
+        robust_scale = (hi - med).abs().clamp_min(1e-3)
+        threshold = hi + self.gate_margin * robust_scale
+        scale = robust_scale
+
+        if int(self.gate_steps.item()) == 0:
+            self.gate_feature_mean.copy_(batch_mean)
+            self.gate_feature_var.copy_(batch_var)
+            self.gate_threshold.copy_(threshold)
+            self.gate_scale.copy_(scale)
+        else:
+            ema = min(max(self.gate_ema, 0.0), 1.0)
+            self.gate_feature_mean.lerp_(batch_mean, ema)
+            self.gate_feature_var.lerp_(batch_var, ema)
+            self.gate_threshold.lerp_(threshold, ema)
+            self.gate_scale.lerp_(scale, ema)
+        self.gate_steps.add_(1)
+
+    def _alpha(self, u: torch.Tensor) -> torch.Tensor:
+        if self.gate_mode == "force_interior":
+            return torch.zeros(*u.shape[:-1], 1, dtype=torch.float32, device=u.device)
+        if self.gate_mode == "force_boundary":
+            return torch.ones(*u.shape[:-1], 1, dtype=torch.float32, device=u.device)
+
+        stat = self._gate_statistic(u)
+        if self.training and self.gate_mode == "calibrated":
+            self._update_gate_calibration(u, stat)
+
+        temp = (self.gate_temp_multiplier * self.gate_scale.to(u.device)).clamp_min(1e-4)
+        threshold = self.gate_threshold.to(u.device)
+        return torch.sigmoid((stat - threshold) / temp)
+
+    def project_input(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        xf = x.to(torch.float32)
+        u = self._center_route(xf)
+        state = self._fan_state(u)
+        block_level = self._block_level(u, state["block_id"])
+        removed = self._lift_route(block_level)
+        x_quot = xf - removed
+        alpha = self._alpha(u)
+
+        denom = torch.linalg.vector_norm(u, dim=-1).clamp_min(1e-6)
+        quot_frac = torch.linalg.vector_norm(block_level, dim=-1) / denom
+        self.last_alpha_mean = alpha.detach().mean()
+        self.last_block_count_mean = state["block_count"].detach().mean()
+        self.last_gap_boundary_mean = state["boundary_soft"].detach().mean()
+        self.last_quotient_fraction_mean = quot_frac.detach().mean()
+        self.last_output_leakage_mean = None
+        return x_quot.to(x.dtype), alpha, state
+
+    def project_output(self, y: torch.Tensor, state: dict) -> torch.Tensor:
+        yf = y.to(torch.float32)
+        v = self._center_route(yf)
+        block_level = self._block_level(v, state["block_id"])
+        projected = yf - self._lift_route(block_level)
+
+        with torch.no_grad():
+            after = self._center_route(projected)
+            after_level = self._block_level(after, state["block_id"])
+            denom = torch.linalg.vector_norm(v, dim=-1).clamp_min(1e-6)
+            leakage = torch.linalg.vector_norm(after_level, dim=-1) / denom
+            self.last_output_leakage_mean = leakage.detach().mean()
+
+        return projected.to(y.dtype)
+
+    @staticmethod
+    def blend(interior: torch.Tensor, boundary: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+        alpha = alpha.to(interior.dtype)
+        return (1.0 - alpha) * interior + alpha * boundary
+
+
 class TropicalAttentionV4(TropicalAttentionV2):
     """
     TropicalAttentionV2-style module that uses tropical-gemm batched kernels
