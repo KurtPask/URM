@@ -1391,6 +1391,7 @@ class TAPRLossHead(nn.Module):
                 torch.zeros_like(ponder_prob),
             ).sum()
 
+        metrics = {name: value.detach() for name, value in metrics.items()}
         returned_outputs: Dict[str, torch.Tensor] = {}
         if return_raw_outputs:
             returned_outputs["raw_outputs"] = outputs

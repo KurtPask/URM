@@ -143,7 +143,9 @@ def evaluate_one_checkpoint(
 
         env = os.environ.copy()
         env.setdefault("DISABLE_COMPILE", "1")
-        return subprocess.run(cmd, check=False, text=True, capture_output=True, env=env)
+        env.setdefault("PYTHONUNBUFFERED", "1")
+
+        return subprocess.run(cmd, check=False, text=True, env=env)
 
     try:
         attempts = [batch_size]
@@ -170,7 +172,11 @@ def evaluate_one_checkpoint(
         if last_result is None or last_result.returncode != 0:
             error_excerpt = ""
             if last_result is not None:
-                merged = (last_result.stdout + "\n" + last_result.stderr).strip()
+                merged = (
+                    (getattr(last_result, "stdout", "") or "")
+                    + "\n"
+                    + (getattr(last_result, "stderr", "") or "")
+                ).strip()
                 error_excerpt = merged[-3000:]
             raise RuntimeError(
                 f"evaluation subprocess failed (batch_size={used_batch}):\n{error_excerpt}"
@@ -239,7 +245,7 @@ def main() -> None:
     parser.add_argument(
         "--data-path",
         type=Path,
-        default=Path("data/sudoku-extreme-1k-aug-1000"),
+        default=Path("data/rebuild-sudoku-extreme-1k-aug-1000"),
         help="Sudoku dataset root",
     )
     parser.add_argument(
@@ -249,7 +255,7 @@ def main() -> None:
         help="Directory for per-run outputs and CSV reports",
     )
     parser.add_argument("--csv-path", type=Path, default=None, help="Optional explicit CSV path")
-    parser.add_argument("--batch-size", type=int, default=512, help="Global evaluation batch size")
+    parser.add_argument("--batch-size", type=int, default=2048, help="Global evaluation batch size")
     parser.add_argument(
         "--max-test-examples-per-set",
         type=int,
@@ -263,7 +269,8 @@ def main() -> None:
         help="Use every Nth test example (N>1 for fast subsampled evaluation).",
     )
     args = parser.parse_args()
-
+    print("args be:")
+    print(args)
     if not args.data_path.exists():
         raise FileNotFoundError(f"Dataset path does not exist: {args.data_path}")
     if not (args.data_path / "test" / "dataset.json").exists():

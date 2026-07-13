@@ -1,6 +1,8 @@
 from typing import Tuple, Optional
 from contextlib import nullcontext
 
+from entmax import sparsemax
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -257,12 +259,32 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class MixedAttention(nn.Module):
     """
-    Routes one subset of heads through flash attention and the rest through tropical attention.
+    Routes one subset of heads through flash attention and the rest through
+    TropicalAttentionV3-style tropical attention.
 
-    Important:
-    - If using GQA/MQA, this splits by whole KV groups so head alignment stays valid.
-    - If num_key_value_heads == 1, both branches share the same K/V head.
+    Key design point:
+    - Flash branch has its own normal q/k/v projection.
+    - Tropical branch has its own q/k/v projection.
+    - Tropical branch applies the valuation map BEFORE its projection, matching
+      the TropicalAttentionV3 / earlier tropical-attention style.
+
+    Tropical branch flow:
+        hidden_states
+          -> log1p(relu(hidden_states))        if valuation_map=True
+          -> tropical_qkv_proj
+          -> tropical GEMM Hilbert scores
+          -> max-plus value aggregation
+          -> expm1(context)                    if valuation_map=True
+
+    Flash branch flow:
+        hidden_states
+          -> flash_qkv_proj
+          -> flash_attn_func
+
+    The two branches only reunite after attention by concatenating heads before
+    the final output projection.
     """
+
     def __init__(
         self,
         hidden_size,
@@ -286,6 +308,9 @@ class MixedAttention(nn.Module):
                 f"num_key_value_heads ({num_key_value_heads}) for GQA-style routing."
             )
 
+        if num_heads < 2:
+            raise ValueError("MixedAttention requires at least 2 query heads.")
+
         self.hidden_size = hidden_size
         self.head_dim = head_dim
         self.num_heads = num_heads
@@ -297,17 +322,11 @@ class MixedAttention(nn.Module):
 
         self.q_per_kv = num_heads // num_key_value_heads
 
-        # Shared projections
-        self.qkv_proj = CastedLinear(
-            hidden_size,
-            (num_heads + 2 * num_key_value_heads) * head_dim,
-            bias=False,
-        )
-        self.o_proj = CastedLinear(self.output_size, hidden_size, bias=False)
-
-        # Split heads in a GQA-safe way.
-        # If kv_heads > 1, split by kv groups.
+        # ------------------------------------------------------------
+        # Decide how many heads go to each side.
+        # ------------------------------------------------------------
         if num_key_value_heads > 1:
+            # Split by whole KV groups so GQA alignment remains valid.
             flash_kv_heads = int(round(num_key_value_heads * flash_fraction))
             flash_kv_heads = max(1, min(flash_kv_heads, num_key_value_heads - 1))
 
@@ -315,10 +334,16 @@ class MixedAttention(nn.Module):
             self.tropical_kv_heads = num_key_value_heads - flash_kv_heads
 
             self.flash_heads = self.flash_kv_heads * self.q_per_kv
-            self.tropical_heads = num_heads - self.flash_heads
+            self.tropical_heads = self.tropical_kv_heads * self.q_per_kv
+
             self.shared_kv = False
+
         else:
-            # MQA case: only one KV head, so both branches share it.
+            # MQA case.
+            #
+            # Important difference from the previous version:
+            # the flash and tropical sides DO NOT share the same projected K/V.
+            # Each branch gets its own single KV head from its own projection.
             flash_heads = int(round(num_heads * flash_fraction))
             flash_heads = max(1, min(flash_heads, num_heads - 1))
 
@@ -327,118 +352,279 @@ class MixedAttention(nn.Module):
 
             self.flash_kv_heads = 1
             self.tropical_kv_heads = 1
-            self.shared_kv = True
 
-    def _tropical_attention(
+            self.shared_kv = False
+
+        if self.flash_heads + self.tropical_heads != num_heads:
+            raise ValueError(
+                f"Head split mismatch: flash_heads={self.flash_heads}, "
+                f"tropical_heads={self.tropical_heads}, num_heads={num_heads}."
+            )
+
+        # ------------------------------------------------------------
+        # Separate branch projections.
+        #
+        # This is the important correction.
+        # We no longer use one shared qkv_proj for both branches.
+        # ------------------------------------------------------------
+        self.flash_qkv_proj = CastedLinear(
+            hidden_size,
+            (self.flash_heads + 2 * self.flash_kv_heads) * head_dim,
+            bias=False,
+        )
+
+        self.tropical_qkv_proj = CastedLinear(
+            hidden_size,
+            (self.tropical_heads + 2 * self.tropical_kv_heads) * head_dim,
+            bias=False,
+        )
+
+        # Shared output projection after head concatenation.
+        self.o_proj = CastedLinear(self.output_size, hidden_size, bias=False)
+
+    def _tropical_input_embedding(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        V3/V1-style early tropical embedding.
+
+        This happens BEFORE the tropical branch q/k/v projection.
+        """
+        if not self.valuation_map:
+            return hidden_states
+
+        return torch.log1p(F.relu(hidden_states.to(torch.float32))).to(hidden_states.dtype)
+
+    def _make_causal_mask(
         self,
-        query: torch.Tensor,   # [bs, q_len, q_heads, head_dim]
-        key: torch.Tensor,     # [bs, k_len, q_heads, head_dim]  (already repeated/aligned)
-        value: torch.Tensor,   # [bs, k_len, q_heads, head_dim]  (already repeated/aligned)
+        q_len: int,
+        k_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        return torch.ones(
+            q_len,
+            k_len,
+            device=device,
+            dtype=torch.bool,
+        ).triu(1)
+
+    def _split_branch_qkv(
+        self,
+        qkv: torch.Tensor,
+        q_heads: int,
+        kv_heads: int,
+        bs: int,
+        seq_len: int,
+    ):
+        """
+        qkv shape after projection:
+            [bs, seq_len, (q_heads + 2 * kv_heads) * head_dim]
+
+        returned:
+            q: [bs, seq_len, q_heads, head_dim]
+            k: [bs, seq_len, kv_heads, head_dim]
+            v: [bs, seq_len, kv_heads, head_dim]
+        """
+        qkv = qkv.view(
+            bs,
+            seq_len,
+            q_heads + 2 * kv_heads,
+            self.head_dim,
+        )
+
+        q = qkv[:, :, :q_heads]
+        k = qkv[:, :, q_heads : q_heads + kv_heads]
+        v = qkv[:, :, q_heads + kv_heads :]
+
+        return q, k, v
+
+    def _tropical_attention_v3_gemm(
+        self,
+        query: torch.Tensor,   # [bs, q_len, tropical_heads, head_dim]
+        key: torch.Tensor,     # [bs, k_len, tropical_heads, head_dim], repeated/aligned
+        value: torch.Tensor,   # [bs, k_len, tropical_heads, head_dim], repeated/aligned
         out_dtype: torch.dtype,
     ) -> torch.Tensor:
-        if self.valuation_map:
-            q_t = torch.log1p(F.relu(query.to(torch.float32)))
-            k_t = torch.log1p(F.relu(key.to(torch.float32)))
-            v_t = torch.log1p(F.relu(value.to(torch.float32)))
-            diff = q_t.unsqueeze(2) - k_t.unsqueeze(1)   # [bs, q_len, k_len, heads, dim]
-        else:
-            v_t = value.to(torch.float32)
-            diff = query.to(torch.float32).unsqueeze(2) - key.to(torch.float32).unsqueeze(1)
+        """
+        TropicalAttentionV3-style tropical GEMM attention.
 
-        max_diff = diff.amax(dim=-1)                    # [bs, q_len, k_len, heads]
-        min_diff = diff.amin(dim=-1)                    # [bs, q_len, k_len, heads]
-        attn_scores = -(max_diff - min_diff)            # [bs, q_len, k_len, heads]
+        Important:
+        - query/key/value are assumed to already come from the tropical branch
+          projection applied to the early tropical embedding.
+        - Therefore, we do NOT apply log1p(relu(.)) to q/k/v here.
+
+        Computes:
+            max_diff_ij = max_d(q_i[d] - k_j[d])
+            min_diff_ij = min_d(q_i[d] - k_j[d])
+            score_ij    = -(max_diff_ij - min_diff_ij)
+
+            context_i[d] = max_j(score_ij + v_j[d])
+        """
+        bs, q_len, heads, dim = query.shape
+        _, k_len, key_heads, key_dim = key.shape
+
+        if key_heads != heads:
+            raise ValueError(
+                f"Tropical branch expected repeated/aligned K/V heads. "
+                f"Got query heads={heads}, key heads={key_heads}."
+            )
+
+        if key_dim != dim:
+            raise ValueError(
+                f"Tropical branch head_dim mismatch: query dim={dim}, key dim={key_dim}."
+            )
+
+        # Use fp32 for tropical GEMM numerical stability.
+        q = query.to(torch.float32)
+        k = key.to(torch.float32)
+        v = value.to(torch.float32)
+
+        # [B, S, H, D] -> [B, H, S, D] -> [B*H, S, D]
+        q = q.transpose(1, 2).contiguous().reshape(bs * heads, q_len, dim)
+        k = k.transpose(1, 2).contiguous().reshape(bs * heads, k_len, dim)
+        v = v.transpose(1, 2).contiguous().reshape(bs * heads, k_len, dim)
+
+        # For q_i - k_j, use q plus negative-transposed k.
+        neg_k_t = -k.transpose(-1, -2).contiguous()  # [B*H, D, K]
+
+        # Hilbert/projective tropical distance pieces:
+        #
+        # max_d(q_i[d] - k_j[d])
+        # min_d(q_i[d] - k_j[d])
+        max_diff = _tg_maxplus_bmm(q, neg_k_t)  # [B*H, Q, K]
+        min_diff = _tg_minplus_bmm(q, neg_k_t)  # [B*H, Q, K]
+
+        attn_scores = -(max_diff - min_diff)    # [B*H, Q, K]
 
         if self.causal:
-            q_len = attn_scores.size(1)
-            k_len = attn_scores.size(2)
-            causal_mask = torch.ones(
-                q_len, k_len, device=attn_scores.device, dtype=torch.bool
-            ).triu(1)
+            causal_mask = self._make_causal_mask(
+                q_len=q_len,
+                k_len=k_len,
+                device=attn_scores.device,
+            )
+
             attn_scores = attn_scores.masked_fill(
-                causal_mask.unsqueeze(0).unsqueeze(-1),
+                causal_mask.unsqueeze(0),
                 torch.finfo(attn_scores.dtype).min,
             )
 
-        sum_sv = attn_scores.unsqueeze(-1) + v_t.unsqueeze(1)   # [bs, q_len, k_len, heads, dim]
-        context = sum_sv.max(dim=2).values                      # [bs, q_len, heads, dim]
+        # Max-plus value aggregation:
+        #
+        # context_i[d] = max_j(score_ij + v_j[d])
+        context = _tg_maxplus_bmm(attn_scores, v)  # [B*H, Q, D]
 
+        # [B*H, Q, D] -> [B, H, Q, D] -> [B, Q, H, D]
+        context = context.reshape(bs, heads, q_len, dim)
+        context = context.transpose(1, 2).contiguous()
+
+        # Return from tropical/log side if using valuation map.
         if self.valuation_map:
-            return torch.expm1(context).to(out_dtype)
+            context = torch.expm1(context)
+
         return context.to(out_dtype)
 
     def forward(self, cos_sin, hidden_states: torch.Tensor) -> torch.Tensor:
         bs, seq_len, _ = hidden_states.shape
 
-        qkv = self.qkv_proj(hidden_states)
-        qkv = qkv.view(
-            bs,
-            seq_len,
-            self.num_heads + 2 * self.num_key_value_heads,
-            self.head_dim,
+        # ------------------------------------------------------------
+        # Flash branch:
+        # normal hidden_states -> q/k/v projection.
+        # ------------------------------------------------------------
+        flash_qkv = self.flash_qkv_proj(hidden_states)
+
+        flash_q, flash_k, flash_v = self._split_branch_qkv(
+            qkv=flash_qkv,
+            q_heads=self.flash_heads,
+            kv_heads=self.flash_kv_heads,
+            bs=bs,
+            seq_len=seq_len,
         )
 
-        query = qkv[:, :, :self.num_heads]
-        key = qkv[:, :, self.num_heads : self.num_heads + self.num_key_value_heads]
-        value = qkv[:, :, self.num_heads + self.num_key_value_heads :]
+        # ------------------------------------------------------------
+        # Tropical branch:
+        # hidden_states -> valuation map -> separate tropical q/k/v projection.
+        #
+        # This is the main correction versus the previous version.
+        # ------------------------------------------------------------
+        tropical_hidden_states = self._tropical_input_embedding(hidden_states)
 
+        tropical_qkv = self.tropical_qkv_proj(tropical_hidden_states)
+
+        tropical_q, tropical_k, tropical_v = self._split_branch_qkv(
+            qkv=tropical_qkv,
+            q_heads=self.tropical_heads,
+            kv_heads=self.tropical_kv_heads,
+            bs=bs,
+            seq_len=seq_len,
+        )
+
+        # ------------------------------------------------------------
+        # Rotary embedding.
+        #
+        # Apply RoPE after each branch's q/k projections.
+        # ------------------------------------------------------------
         if cos_sin is not None:
             cos, sin = cos_sin
-            query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
-        # -------------------------
-        # Split into flash / tropical branches
-        # -------------------------
-        if self.shared_kv:
-            # MQA: one KV head shared by both branches
-            flash_q = query[:, :, :self.flash_heads]
-            tropical_q = query[:, :, self.flash_heads:]
+            flash_q, flash_k = apply_rotary_pos_emb(
+                flash_q,
+                flash_k,
+                cos,
+                sin,
+            )
 
-            flash_k = key
-            flash_v = value
+            tropical_q, tropical_k = apply_rotary_pos_emb(
+                tropical_q,
+                tropical_k,
+                cos,
+                sin,
+            )
 
-            tropical_k = key.expand(-1, -1, self.tropical_heads, -1)
-            tropical_v = value.expand(-1, -1, self.tropical_heads, -1)
-
-        else:
-            # GQA-safe split by whole KV groups
-            flash_q = query[:, :, :self.flash_heads]
-            tropical_q = query[:, :, self.flash_heads:]
-
-            flash_k = key[:, :, :self.flash_kv_heads]
-            flash_v = value[:, :, :self.flash_kv_heads]
-
-            tropical_k = key[:, :, self.flash_kv_heads:]
-            tropical_v = value[:, :, self.flash_kv_heads:]
-
-            # Tropical branch wants head-aligned K/V
-            tropical_k = repeat_kv(tropical_k, self.q_per_kv)
-            tropical_v = repeat_kv(tropical_v, self.q_per_kv)
-
-        # -------------------------
-        # Flash branch
-        # -------------------------
+        # ------------------------------------------------------------
+        # Flash attention branch.
+        #
+        # flash_attn_func can handle MQA/GQA when q heads are a multiple
+        # of kv heads.
+        # ------------------------------------------------------------
         flash_out = flash_attn_func(
             q=flash_q,
             k=flash_k,
             v=flash_v,
             causal=self.causal,
         )
+
         if isinstance(flash_out, tuple):  # FA2 / FA3 compatibility
             flash_out = flash_out[0]
 
-        # -------------------------
-        # Tropical branch
-        # -------------------------
-        tropical_out = self._tropical_attention(
-            tropical_q,
-            tropical_k,
-            tropical_v,
+        # ------------------------------------------------------------
+        # Tropical branch.
+        #
+        # Tropical GEMM attention wants K/V repeated to query-head alignment.
+        # ------------------------------------------------------------
+        if self.tropical_kv_heads != self.tropical_heads:
+            if self.tropical_heads % self.tropical_kv_heads != 0:
+                raise ValueError(
+                    f"tropical_heads ({self.tropical_heads}) must be divisible by "
+                    f"tropical_kv_heads ({self.tropical_kv_heads})."
+                )
+
+            tropical_repeat = self.tropical_heads // self.tropical_kv_heads
+            tropical_k = repeat_kv(tropical_k, tropical_repeat)
+            tropical_v = repeat_kv(tropical_v, tropical_repeat)
+
+        tropical_out = self._tropical_attention_v3_gemm(
+            query=tropical_q,
+            key=tropical_k,
+            value=tropical_v,
             out_dtype=hidden_states.dtype,
         )
 
-        # Concatenate heads back together
-        attn_output = torch.cat([flash_out, tropical_out], dim=2)   # [bs, seq, num_heads, head_dim]
+        # ------------------------------------------------------------
+        # Recombine heads and project out.
+        # ------------------------------------------------------------
+        attn_output = torch.cat(
+            [flash_out, tropical_out],
+            dim=2,
+        )  # [bs, seq_len, num_heads, head_dim]
+
         attn_output = attn_output.reshape(bs, seq_len, self.output_size)
 
         return self.o_proj(attn_output)
@@ -603,7 +789,7 @@ class TropicalAttention(nn.Module):
         self.causal = causal
         self.attn_dropout = attn_dropout
 
-        self.out = CastedLinear(hidden_size, hidden_size, bias=False)
+        self.o_proj = CastedLinear(hidden_size, hidden_size, bias=False)
         self.q_dropout = nn.Dropout(q_dropout)
         self.k_dropout = nn.Dropout(k_dropout)
         self.v_dropout = nn.Dropout(v_dropout)
@@ -735,7 +921,7 @@ class TropicalAttention(nn.Module):
         )
 
         context = torch.expm1(context)
-        output = self.out(context)
+        output = self.o_proj(context)
 
         return output, attn_scores
 
@@ -745,9 +931,68 @@ class TropicalAttention(nn.Module):
 
 
 class TropicalAttentionV3(TropicalAttention):
+    def _apply_shared_qk_feature_dropout_v3(
+        self,
+        q: torch.Tensor,  # [B*H, seq_len, d_k]
+        k: torch.Tensor,  # [B*H, seq_len, d_k]
+    ):
+        """
+        Shared Q/K tropical feature dropout.
+
+        Uses one mask for both q and k, shared across sequence positions for each
+        batch-head, so every q_i/k_j pair has the same surviving feature coordinates.
+
+        Returns separate inputs for max-plus and min-plus reductions because dropped
+        coordinates must be excluded from both max and min selection.
+        """
+        if self.q_dropout.p != self.k_dropout.p:
+            raise ValueError(
+                "TropicalAttentionV3 shared qk dropout requires q_dropout == k_dropout."
+            )
+
+        p = self.q_dropout.p
+
+        if (not self.training) or p <= 0.0:
+            neg_k_t = (-k).transpose(1, 2).contiguous()
+            return q, neg_k_t, q, neg_k_t
+
+        keep_prob = 1.0 - p
+
+        # q/k are [B*H, seq_len, d_k]
+        # mask is [B*H, 1, d_k], shared across sequence.
+        # This avoids q_i and k_j having disjoint surviving coordinates.
+        keep_mask = (
+            torch.rand(q.shape[0], 1, q.shape[-1], device=q.device) < keep_prob
+        )
+
+        # Ensure at least one coordinate survives per batch-head.
+        all_dropped = ~keep_mask.any(dim=-1, keepdim=True)
+        if all_dropped.any():
+            keep_mask = torch.where(all_dropped, torch.ones_like(keep_mask), keep_mask)
+
+        neg_k = -k
+
+        # Use large finite sentinels instead of +/-inf in case the custom kernels
+        # dislike infinities.
+        NEG = -1.0e30
+        POS = 1.0e30
+
+        # For max(q - k): dropped coordinates should never win max.
+        q_for_max = q.masked_fill(~keep_mask, NEG).contiguous()
+        neg_k_for_max_t = neg_k.masked_fill(~keep_mask, NEG).transpose(1, 2).contiguous()
+
+        # For min(q - k): dropped coordinates should never win min.
+        q_for_min = q.masked_fill(~keep_mask, POS).contiguous()
+        neg_k_for_min_t = neg_k.masked_fill(~keep_mask, POS).transpose(1, 2).contiguous()
+
+        return q_for_max, neg_k_for_max_t, q_for_min, neg_k_for_min_t
+    
     def forward_with_scores(self, x: torch.Tensor, cos_sin: Optional[CosSin] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.q_dropout.p != 0.0 or self.k_dropout.p != 0.0 or self.v_dropout.p != 0.0:
-            raise ValueError("TropicalAttentionV3 currently requires q_dropout=k_dropout=v_dropout=0.0.")
+        if self.v_dropout.p != 0.0:
+            raise ValueError("TropicalAttentionV3 qk dropout leaves v untouched; set v_dropout=0.0.")
+
+        if self.q_dropout.p != self.k_dropout.p:
+            raise ValueError("TropicalAttentionV3 shared qk dropout requires q_dropout == k_dropout.")
         if not self.symmetric:
             raise ValueError("TropicalAttentionV3 currently supports only symmetric Hilbert tropical attention.")
 
@@ -784,9 +1029,12 @@ class TropicalAttentionV3(TropicalAttention):
         k = k.to(torch.float32).contiguous()
         v = v.to(torch.float32).contiguous()
 
-        neg_k_t = (-k).transpose(1, 2).contiguous()
-        max_diff = _tg_maxplus_bmm(q, neg_k_t)
-        min_diff = _tg_minplus_bmm(q, neg_k_t)
+        q_for_max, neg_k_for_max_t, q_for_min, neg_k_for_min_t = (
+            self._apply_shared_qk_feature_dropout_v3(q, k)
+        )
+
+        max_diff = _tg_maxplus_bmm(q_for_max, neg_k_for_max_t)
+        min_diff = _tg_minplus_bmm(q_for_min, neg_k_for_min_t)
         attn_scores = -(max_diff - min_diff)
 
         context = _tg_maxplus_bmm(attn_scores, v)
@@ -796,7 +1044,166 @@ class TropicalAttentionV3(TropicalAttention):
             .reshape(batch_size, seq_len, -1)
         )
         context = torch.expm1(context)
-        output = self.out(context.to(x.dtype))
+        output = self.o_proj(context.to(x.dtype))
+        return output, attn_scores
+
+    def forward(self, cos_sin: Optional[CosSin], hidden_states: torch.Tensor) -> torch.Tensor:
+        output, _ = self.forward_with_scores(hidden_states, cos_sin=cos_sin)
+        return output
+
+
+class SoftTropicalAttention(TropicalAttention):
+    def _sample_shared_qk_feature_mask_v3(
+        self,
+        q: torch.Tensor,  # [B*H, seq_len, d_k]
+    ) -> Optional[torch.Tensor]:
+        """
+        Returns a shared Q/K feature mask of shape [B*H, 1, d_k],
+        or None if dropout is inactive.
+
+        This is for sparsemax/softened tropical scoring, where dropped coordinates
+        should be excluded from sparsemax support.
+        """
+        if self.q_dropout.p != self.k_dropout.p:
+            raise ValueError(
+                "TropicalAttentionV3 shared qk dropout requires q_dropout == k_dropout."
+            )
+
+        p = self.q_dropout.p
+
+        if (not self.training) or p <= 0.0:
+            return None
+
+        keep_prob = 1.0 - p
+
+        keep_mask = (
+            torch.rand(q.shape[0], 1, q.shape[-1], device=q.device) < keep_prob
+        )
+
+        # Ensure at least one coordinate survives per batch-head.
+        all_dropped = ~keep_mask.any(dim=-1, keepdim=True)
+        if all_dropped.any():
+            keep_mask = torch.where(all_dropped, torch.ones_like(keep_mask), keep_mask)
+
+        return keep_mask
+
+    def _sparsemax_tropical_scores_chunked_v3(
+        self,
+        q: torch.Tensor,          # [B*H, seq_len, d_k]
+        k: torch.Tensor,          # [B*H, seq_len, d_k]
+        chunk_size: int = 32,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Sparsemax-softened symmetric Hilbert tropical attention.
+
+        Replaces hard:
+
+            -(max(q-k) - min(q-k))
+
+        with:
+
+            -( <sparsemax(q-k), q-k>
+            - <sparsemax(k-q), q-k> )
+
+        sparsemax is over the feature dimension d_k.
+        """
+        if temperature <= 0:
+            raise ValueError("temperature must be positive.")
+
+        BH, seq_len, d_k = q.shape
+        keep_mask = self._sample_shared_qk_feature_mask_v3(q)
+
+        k_view = k.unsqueeze(1)  # [B*H, 1, seq_len, d_k]
+        out = []
+
+        # Finite mask value is safer than -inf for some custom/autograd paths.
+        MASK_NEG = -1.0e9
+
+        for start in range(0, seq_len, chunk_size):
+            stop = min(start + chunk_size, seq_len)
+
+            # [B*H, chunk, seq_len, d_k]
+            diff = q[:, start:stop, :].unsqueeze(2) - k_view
+
+            logits_max = diff / temperature
+            logits_min = -diff / temperature
+
+            if keep_mask is not None:
+                # [B*H, 1, 1, d_k], shared over query/key positions.
+                feature_mask = keep_mask.unsqueeze(1)
+
+                logits_max = logits_max.masked_fill(~feature_mask, MASK_NEG)
+                logits_min = logits_min.masked_fill(~feature_mask, MASK_NEG)
+
+            p_max = sparsemax(logits_max, dim=-1)
+            p_min = sparsemax(logits_min, dim=-1)
+
+            soft_max = (p_max * diff).sum(dim=-1)  # [B*H, chunk, seq_len]
+            soft_min = (p_min * diff).sum(dim=-1)  # [B*H, chunk, seq_len]
+
+            d_trop = soft_max - soft_min
+            out.append(-d_trop)
+
+        return torch.cat(out, dim=1)
+    
+    def forward_with_scores(self, x: torch.Tensor, cos_sin: Optional[CosSin] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.v_dropout.p != 0.0:
+            raise ValueError("TropicalAttentionV3 qk dropout leaves v untouched; set v_dropout=0.0.")
+
+        if self.q_dropout.p != self.k_dropout.p:
+            raise ValueError("TropicalAttentionV3 shared qk dropout requires q_dropout == k_dropout.")
+        if not self.symmetric:
+            raise ValueError("TropicalAttentionV3 currently supports only symmetric Hilbert tropical attention.")
+
+        batch_size, seq_len, _ = x.size()
+        x_pos = torch.log1p(F.relu(x))
+        if self.tropical_norm != "none":
+            x_pos = self.normalize_tropical(x_pos)
+
+        if self.tropical_qkv_proj:
+            q = self.query_proj(x_pos)
+            k = self.key_proj(x_pos)
+            v = self.value_proj(x_pos)
+        else:
+            q, k, v = x_pos, x_pos, x_pos
+
+        q = q.reshape(batch_size, seq_len, self.n_heads, self.d_k)
+        k = k.reshape(batch_size, seq_len, self.n_heads, self.d_k)
+        v = v.reshape(batch_size, seq_len, self.n_heads, self.d_k)
+
+        if cos_sin is not None:
+            cos, sin = cos_sin
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        q = q.permute(0, 2, 1, 3).reshape(batch_size * self.n_heads, seq_len, self.d_k)
+        k = k.permute(0, 2, 1, 3).reshape(batch_size * self.n_heads, seq_len, self.d_k)
+        v = v.permute(0, 2, 1, 3).reshape(batch_size * self.n_heads, seq_len, self.d_k)
+
+        if self.tropical_proj:
+            q = self.query_trop(q)
+            k = self.key_trop(k)
+            v = self.value_trop(v)
+
+        q = q.to(torch.float32).contiguous()
+        k = k.to(torch.float32).contiguous()
+        v = v.to(torch.float32).contiguous()
+
+        attn_scores = self._sparsemax_tropical_scores_chunked_v3(
+            q,
+            k,
+            chunk_size=32,
+            temperature=1.0,
+        )
+
+        context = _tg_maxplus_bmm(attn_scores, v)
+        context = (
+            context.reshape(batch_size, self.n_heads, seq_len, self.d_k)
+            .permute(0, 2, 1, 3)
+            .reshape(batch_size, seq_len, -1)
+        )
+        context = torch.expm1(context)
+        output = self.o_proj(context.to(x.dtype))
         return output, attn_scores
 
     def forward(self, cos_sin: Optional[CosSin], hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1103,6 +1510,219 @@ class TropicalAttentionV4(TropicalAttentionV2):
         attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)
         return self.o_proj(attn_output)
 
+
+class TropicalAttentionV5(Attention):
+    """
+    Drop-in normal Attention variant where only the attention score calculation
+    is replaced.
+
+    Normal attention:
+        softmax((Q @ K.T) / sqrt(d_k)) @ V
+
+    TropicalAttentionV5:
+        softmax((-d_trop(Q, K)) / sqrt(d_k)) @ V
+
+    where:
+        d_trop(Q_i, K_j) = max_d(Q_i[d] - K_j[d]) - min_d(Q_i[d] - K_j[d])
+
+    Notes:
+    - No valuation map.
+    - No log1p/relu transform.
+    - No expm1 output map.
+    - No tropical max-plus aggregation over V.
+    - V is combined with ordinary matrix multiplication after softmax.
+    """
+
+    def __init__(
+        self,
+        hidden_size,
+        head_dim,
+        num_heads,
+        num_key_value_heads,
+        causal=False,
+        attn_dropout=0.0,
+        use_tropical_gemm: bool = True,
+        allow_torch_fallback: bool = False,
+        **kwargs,
+    ):
+        super().__init__(
+            hidden_size=hidden_size,
+            head_dim=head_dim,
+            num_heads=num_heads,
+            num_key_value_heads=num_key_value_heads,
+            causal=causal,
+            attn_dropout=attn_dropout,
+        )
+
+        self.scale = self.head_dim ** -0.5
+        self.use_tropical_gemm = use_tropical_gemm
+        self.allow_torch_fallback = allow_torch_fallback
+
+        # The current normal Attention layer effectively uses dropout_p=0.0
+        # in its PyTorch SDPA fallback, so keep V5 the same by default.
+        self.attn_dropout = 0.0
+
+    def _tropical_scores_gemm(
+        self,
+        query: torch.Tensor,  # [batch_heads, q_len, head_dim]
+        key: torch.Tensor,    # [batch_heads, k_len, head_dim]
+    ) -> torch.Tensor:
+        """
+        Returns pre-softmax tropical similarity scores:
+            -d_trop(query, key)
+
+        Shape:
+            [batch_heads, q_len, k_len]
+        """
+        query = query.to(torch.float32).contiguous()
+        key = key.to(torch.float32).contiguous()
+
+        # V4 pattern:
+        #   max_d(q[d] - k[d]) via max-plus matmul(q, -k.T)
+        #   min_d(q[d] - k[d]) via min-plus matmul(q, -k.T)
+        #
+        # This is equivalent to max(K-Q)-min(K-Q) for the symmetric Hilbert
+        # tropical distance, because reversing the sign swaps max/min but
+        # leaves the range unchanged.
+        neg_key_t = (-key).transpose(1, 2).contiguous()
+
+        max_diff = _tg_maxplus_bmm(query, neg_key_t)
+        min_diff = _tg_minplus_bmm(query, neg_key_t)
+
+        return -(max_diff - min_diff)
+
+    def _tropical_scores_torch(
+        self,
+        query: torch.Tensor,  # [batch_heads, q_len, head_dim]
+        key: torch.Tensor,    # [batch_heads, k_len, head_dim]
+    ) -> torch.Tensor:
+        """
+        Pure PyTorch fallback. This is simple and differentiable, but it
+        materializes [batch_heads, q_len, k_len, head_dim], so it is much more
+        memory hungry than the tropical-gemm path.
+        """
+        query = query.to(torch.float32)
+        key = key.to(torch.float32)
+
+        diff = query.unsqueeze(2) - key.unsqueeze(1)
+        max_diff = diff.amax(dim=-1)
+        min_diff = diff.amin(dim=-1)
+
+        return -(max_diff - min_diff)
+
+    def _tropical_scores(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.use_tropical_gemm:
+            try:
+                return self._tropical_scores_gemm(query, key)
+            except Exception:
+                if not self.allow_torch_fallback:
+                    raise
+
+        return self._tropical_scores_torch(query, key)
+
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = hidden_states.shape
+
+        # Same qkv projection as normal Attention.
+        qkv = self.qkv_proj(hidden_states)
+
+        qkv = qkv.view(
+            batch_size,
+            seq_len,
+            self.num_heads + 2 * self.num_key_value_heads,
+            self.head_dim,
+        )
+
+        query = qkv[:, :, :self.num_heads]
+        key = qkv[:, :, self.num_heads : self.num_heads + self.num_key_value_heads]
+        value = qkv[:, :, self.num_heads + self.num_key_value_heads :]
+
+        # Same RoPE placement as normal Attention.
+        if cos_sin is not None:
+            cos, sin = cos_sin
+            query, key = apply_rotary_pos_emb(query, key, cos, sin)
+
+        # Align GQA/MQA K/V heads to Q heads for the custom score path.
+        if self.num_key_value_heads != self.num_heads:
+            if self.num_heads % self.num_key_value_heads != 0:
+                raise ValueError(
+                    "num_heads must be divisible by num_key_value_heads "
+                    "for TropicalAttentionV5."
+                )
+
+            repeat_factor = self.num_heads // self.num_key_value_heads
+            key = repeat_kv(key, repeat_factor)
+            value = repeat_kv(value, repeat_factor)
+
+        q_len = query.size(1)
+        k_len = key.size(1)
+
+        # [bs, seq, heads, dim] -> [bs * heads, seq, dim]
+        query_b = (
+            query.permute(0, 2, 1, 3)
+            .reshape(batch_size * self.num_heads, q_len, self.head_dim)
+            .contiguous()
+        )
+        key_b = (
+            key.permute(0, 2, 1, 3)
+            .reshape(batch_size * self.num_heads, k_len, self.head_dim)
+            .contiguous()
+        )
+        value_b = (
+            value.permute(0, 2, 1, 3)
+            .reshape(batch_size * self.num_heads, k_len, self.head_dim)
+            .to(torch.float32)
+            .contiguous()
+        )
+
+        # Replace QK^T with negative tropical distance.
+        attn_scores = self._tropical_scores(query_b, key_b)
+
+        # Same conceptual scale as normal dot-product attention.
+        attn_scores = attn_scores * self.scale
+
+        if self.causal:
+            causal_mask = torch.ones(
+                q_len,
+                k_len,
+                device=attn_scores.device,
+                dtype=torch.bool,
+            ).triu(1)
+
+            attn_scores = attn_scores.masked_fill(
+                causal_mask.unsqueeze(0),
+                torch.finfo(attn_scores.dtype).min,
+            )
+
+        # Normal softmax, not tropical aggregation.
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+
+        if self.attn_dropout > 0.0 and self.training:
+            attn_weights = F.dropout(
+                attn_weights,
+                p=self.attn_dropout,
+                training=True,
+            )
+
+        # Normal weighted sum over V.
+        context = torch.bmm(attn_weights, value_b)
+
+        # [bs * heads, seq, dim] -> [bs, seq, heads, dim]
+        context = (
+            context.reshape(batch_size, self.num_heads, q_len, self.head_dim)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+
+        attn_output = context.reshape(batch_size, q_len, self.output_size)
+        attn_output = attn_output.to(hidden_states.dtype)
+
+        return self.o_proj(attn_output)
+        
 
 class SwiGLU(nn.Module):
     def __init__(self, hidden_size: int, expansion: float, mlp_dropout: float = 0.0):

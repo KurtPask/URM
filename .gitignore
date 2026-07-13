@@ -10,6 +10,8 @@ new_env/
 data/arc1concept-aug-1000
 data/arc2concept-aug-1000
 data/sudoku-extreme-1k-aug-1000
+data/sudoku-tdoku-75-1k-aug-1000
+data/rebuild-sudoku-extreme-1k-aug-1000
 wandb/
 checkpoints/
 wandb_sync.sh

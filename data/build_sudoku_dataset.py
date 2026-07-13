@@ -21,6 +21,7 @@ class DataProcessConfig(BaseModel):
 
     subsample_size: Optional[int] = None
     min_difficulty: Optional[int] = None
+    max_difficulty: Optional[int] = None
     num_aug: int = 0
 
 
@@ -65,8 +66,9 @@ def convert_subset(set_name: str, config: DataProcessConfig):
     with open(hf_hub_download(config.source_repo, f"{set_name}.csv", repo_type="dataset"), newline="") as csvfile:
         reader = csv.reader(csvfile)
         next(reader)  # Skip header
+        boo_train = set_name == "train"
         for source, q, a, rating in reader:
-            if (config.min_difficulty is None) or (int(rating) >= config.min_difficulty):
+            if (config.min_difficulty is None) or (boo_train == False and (int(rating) >= config.min_difficulty)) or (boo_train == True and (int(rating) <= config.min_difficulty)):
                 assert len(q) == 81 and len(a) == 81
                 
                 inputs.append(np.frombuffer(q.replace('.', '0').encode(), dtype=np.uint8).reshape(9, 9) - ord('0'))

@@ -107,4 +107,7 @@ class Sudoku:
             "Sudoku/cell_accuracy": totals["num_cells_correct"] / num_cells,
             "Sudoku/exact_accuracy": totals["num_exact"] / num_examples,
             "Sudoku/valid_solution_rate": totals["num_valid_solutions"] / num_examples,
+            "Sudoku/num_examples": totals["num_examples"],
+            "Sudoku/num_cells": totals["num_cells"],
+            "Sudoku/num_exact": totals["num_exact"],
         }
